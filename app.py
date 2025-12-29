@@ -5,6 +5,7 @@ import plotly.express as px
 from datetime import datetime, date
 from fpdf import FPDF
 import base64
+import json
 from io import BytesIO
 
 # ================= CONFIGURACIÓN VISUAL =================
@@ -13,9 +14,19 @@ st.set_page_config(page_title="Control Financiero Pro", page_icon="💎", layout
 # ================= CONEXIÓN A GOOGLE SHEETS =================
 def conectar_google():
     try:
-        gc = gspread.service_account(filename='credentials.json')
+        # 1. INTENTO NUBE: Buscamos credenciales en los Secretos de Streamlit
+        if 'gcp_credentials' in st.secrets:
+            # Leemos el secreto como un texto JSON y lo convertimos a diccionario
+            creds_dict = json.loads(st.secrets['gcp_credentials'])
+            gc = gspread.service_account_from_dict(creds_dict)
+        
+        # 2. INTENTO LOCAL: Si no hay secretos, buscamos el archivo en la PC
+        else:
+            gc = gspread.service_account(filename='credentials.json')
+
         sh = gc.open("BaseDatos_Maestra")
         return sh.sheet1
+
     except Exception as e:
         st.error(f"❌ Error de conexión: {e}")
         return None
