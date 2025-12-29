@@ -1,0 +1,6 @@
+streamlit
+pandas
+gspread
+plotly
+fpdf
+xlsxwriter
