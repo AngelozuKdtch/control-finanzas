@@ -6,32 +6,38 @@ from datetime import datetime
 from fpdf import FPDF
 import base64
 from io import BytesIO
-import json  # <--- IMPORTANTE
+import json
+import ast  # <--- NUEVA HERRAMIENTA MÁGICA
 
 # ================= CONFIGURACIÓN =================
 st.set_page_config(page_title="Control Financiero Pro", page_icon="💎", layout="wide")
 
-# ================= CONEXIÓN A GOOGLE (AUTO-REPARABLE) =================
+# ================= CONEXIÓN A GOOGLE (TRADUCTOR UNIVERSAL) =================
 def conectar_google():
     try:
         # 1. INTENTO NUBE: Buscamos en Secretos
         if 'gcp_credentials' in st.secrets:
             secret_value = st.secrets['gcp_credentials']
             
-            # Si Streamlit ya lo leyó como diccionario
+            # Caso A: Si ya es un diccionario, usarlo directo
             if isinstance(secret_value, dict):
                 creds_dict = secret_value
             
-            # Si es texto, intentamos repararlo
+            # Caso B: Si es texto, intentar todas las formas posibles de leerlo
             else:
                 try:
+                    # Intento 1: JSON Estándar
                     creds_dict = json.loads(secret_value)
-                except json.JSONDecodeError:
-                    # AQUÍ ESTÁ LA CURA: Reemplazamos saltos de línea malos
-                    # Convertimos saltos reales en el texto "\n"
-                    fixed_string = secret_value.replace('\n', '\\n')
-                    # Intentamos leer de nuevo permitiendo caracteres de control
-                    creds_dict = json.loads(fixed_string, strict=False)
+                except:
+                    try:
+                        # Intento 2: Formato Python (Comillas simples)
+                        # Esta herramienta 'ast' lee diccionarios escritos con comillas simples
+                        creds_dict = ast.literal_eval(secret_value)
+                    except:
+                        # Intento 3: Limpieza profunda (Saltos de línea + Comillas raras)
+                        fixed_string = secret_value.replace('\n', '\\n')
+                        fixed_string = fixed_string.replace('“', '"').replace('”', '"') # Quitar comillas chuecas
+                        creds_dict = json.loads(fixed_string, strict=False)
 
             gc = gspread.service_account_from_dict(creds_dict)
         
@@ -43,8 +49,7 @@ def conectar_google():
         return sh.sheet1
 
     except Exception as e:
-        # Si falla, mostramos el error técnico
-        st.error(f"❌ Error de conexión (Detalle): {e}")
+        st.error(f"❌ Error de conexión blindada: {e}")
         return None
 
 # ================= FUNCIONES AUXILIARES =================
