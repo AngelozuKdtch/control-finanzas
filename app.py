@@ -1,3 +1,4 @@
+import json
 import streamlit as st
 import pandas as pd
 import gspread
@@ -5,7 +6,6 @@ import plotly.express as px
 from datetime import datetime, date
 from fpdf import FPDF
 import base64
-import json
 from io import BytesIO
 
 # ================= CONFIGURACIÓN VISUAL =================
@@ -254,3 +254,4 @@ else:
     # --- TABLA ---
     with st.expander("📂 Ver Tabla Detallada de Movimientos"):
         st.dataframe(df_view.style.format({"IMPORTE": "${:,.2f}"}), use_container_width=True)
+
