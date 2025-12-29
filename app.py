@@ -7,36 +7,32 @@ from fpdf import FPDF
 import base64
 from io import BytesIO
 import json
-import ast  # <--- NUEVA HERRAMIENTA MÁGICA
 
 # ================= CONFIGURACIÓN =================
 st.set_page_config(page_title="Control Financiero Pro", page_icon="💎", layout="wide")
-# ---Conectar google
+
+# ================= CONEXIÓN A GOOGLE (REPARADOR DE SALTOS DE LÍNEA) =================
 def conectar_google():
     try:
         # 1. INTENTO NUBE
         if 'gcp_credentials' in st.secrets:
             secret_value = st.secrets['gcp_credentials']
             
-            # --- ZONA DE AUTOPSIA ---
-            # Esto imprimirá en tu pantalla lo que la App está viendo.
-            # BORRA ESTO DESPUÉS DE ARREGLARLO POR SEGURIDAD
-            st.warning("⚠️ MODO DEBUG ACTIVO")
-            st.write("Lo que Streamlit está leyendo (Primeros 50 caracteres):")
-            st.code(str(secret_value)[:100]) 
-            # -------------------------
-
-            # Intentamos leerlo como sea
+            # Si Streamlit ya lo leyó como diccionario, lo usamos
             if isinstance(secret_value, dict):
                 creds_dict = secret_value
             else:
-                # Limpieza agresiva de comillas
+                # Si es texto, intentamos leerlo y REPARARLO si falla
                 try:
                     creds_dict = json.loads(secret_value)
-                except:
-                    # Si falla, intentamos convertir comillas simples a dobles manualmente
-                    fixed = secret_value.replace("'", '"') 
-                    creds_dict = json.loads(fixed)
+                except json.JSONDecodeError:
+                    # AQUÍ ESTÁ LA SOLUCIÓN AL ERROR "INVALID CONTROL CHARACTER"
+                    # 1. Reemplazamos saltos de línea reales por "\n"
+                    fixed_string = secret_value.replace('\n', '\\n')
+                    # 2. Reemplazamos tabulaciones por nada
+                    fixed_string = fixed_string.replace('\t', '')
+                    # 3. Leemos con 'strict=False' para ser tolerantes
+                    creds_dict = json.loads(fixed_string, strict=False)
 
             gc = gspread.service_account_from_dict(creds_dict)
         
@@ -48,8 +44,10 @@ def conectar_google():
         return sh.sheet1
 
     except Exception as e:
-        st.error(f"❌ Error Fatal: {e}")
+        st.error(f"❌ Error de conexión: {e}")
+        st.stop()
         return None
+
 # ================= FUNCIONES AUXILIARES =================
 def crear_recibo_pdf(fecha, cuenta, monto, concepto):
     pdf = FPDF()
@@ -204,4 +202,3 @@ else:
                 st.markdown(href, unsafe_allow_html=True)
     with st.expander("📂 Ver Tabla Detallada de Movimientos"):
         st.dataframe(df_view.style.format({"IMPORTE": "${:,.2f}"}), use_container_width=True)
-
