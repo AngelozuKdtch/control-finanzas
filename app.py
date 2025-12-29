@@ -12,24 +12,33 @@ from io import BytesIO
 st.set_page_config(page_title="Control Financiero Pro", page_icon="💎", layout="wide")
 
 # ================= CONEXIÓN A GOOGLE SHEETS =================
+# --- CÓDIGO DE DIAGNÓSTICO (Modo Detective) ---
 def conectar_google():
-    try:
-        # 1. INTENTO NUBE: Buscamos credenciales en los Secretos de Streamlit
-        if 'gcp_credentials' in st.secrets:
-            # Leemos el secreto como un texto JSON y lo convertimos a diccionario
+    # 1. Imprimir qué secretos ve la App (Solo mostrará los nombres, no las claves)
+    st.write("🔍 Diagnóstico de Secretos:", list(st.secrets.keys()))
+    
+    # 2. INTENTO NUBE
+    if 'gcp_credentials' in st.secrets:
+        st.success("✅ ¡El secreto 'gcp_credentials' EXISTE!")
+        try:
             creds_dict = json.loads(st.secrets['gcp_credentials'])
             gc = gspread.service_account_from_dict(creds_dict)
-        
-        # 2. INTENTO LOCAL: Si no hay secretos, buscamos el archivo en la PC
-        else:
+            sh = gc.open("BaseDatos_Maestra")
+            return sh.sheet1
+        except Exception as e:
+            st.error(f"❌ El secreto existe, pero el JSON está mal: {e}")
+            return None
+            
+    # 3. INTENTO LOCAL (PC)
+    else:
+        st.warning("⚠️ NO detecté 'gcp_credentials'. Buscando archivo 'credentials.json'...")
+        try:
             gc = gspread.service_account(filename='credentials.json')
-
-        sh = gc.open("BaseDatos_Maestra")
-        return sh.sheet1
-
-    except Exception as e:
-        st.error(f"❌ Error de conexión: {e}")
-        return None
+            sh = gc.open("BaseDatos_Maestra")
+            return sh.sheet1
+        except Exception as e:
+            st.error(f"❌ Error Final: No hay secreto ni archivo local. Detalle: {e}")
+            return None
 
 # ================= GENERADOR DE PDF (RECIBOS) =================
 def crear_recibo_pdf(fecha, cuenta, monto, concepto):
@@ -254,4 +263,5 @@ else:
     # --- TABLA ---
     with st.expander("📂 Ver Tabla Detallada de Movimientos"):
         st.dataframe(df_view.style.format({"IMPORTE": "${:,.2f}"}), use_container_width=True)
+
 
