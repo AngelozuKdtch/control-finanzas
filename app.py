@@ -11,37 +11,36 @@ import ast  # <--- NUEVA HERRAMIENTA MÁGICA
 
 # ================= CONFIGURACIÓN =================
 st.set_page_config(page_title="Control Financiero Pro", page_icon="💎", layout="wide")
-
-# ================= CONEXIÓN A GOOGLE (TRADUCTOR UNIVERSAL) =================
+# ---Conectar google
 def conectar_google():
     try:
-        # 1. INTENTO NUBE: Buscamos en Secretos
+        # 1. INTENTO NUBE
         if 'gcp_credentials' in st.secrets:
             secret_value = st.secrets['gcp_credentials']
             
-            # Caso A: Si ya es un diccionario, usarlo directo
+            # --- ZONA DE AUTOPSIA ---
+            # Esto imprimirá en tu pantalla lo que la App está viendo.
+            # BORRA ESTO DESPUÉS DE ARREGLARLO POR SEGURIDAD
+            st.warning("⚠️ MODO DEBUG ACTIVO")
+            st.write("Lo que Streamlit está leyendo (Primeros 50 caracteres):")
+            st.code(str(secret_value)[:100]) 
+            # -------------------------
+
+            # Intentamos leerlo como sea
             if isinstance(secret_value, dict):
                 creds_dict = secret_value
-            
-            # Caso B: Si es texto, intentar todas las formas posibles de leerlo
             else:
+                # Limpieza agresiva de comillas
                 try:
-                    # Intento 1: JSON Estándar
                     creds_dict = json.loads(secret_value)
                 except:
-                    try:
-                        # Intento 2: Formato Python (Comillas simples)
-                        # Esta herramienta 'ast' lee diccionarios escritos con comillas simples
-                        creds_dict = ast.literal_eval(secret_value)
-                    except:
-                        # Intento 3: Limpieza profunda (Saltos de línea + Comillas raras)
-                        fixed_string = secret_value.replace('\n', '\\n')
-                        fixed_string = fixed_string.replace('“', '"').replace('”', '"') # Quitar comillas chuecas
-                        creds_dict = json.loads(fixed_string, strict=False)
+                    # Si falla, intentamos convertir comillas simples a dobles manualmente
+                    fixed = secret_value.replace("'", '"') 
+                    creds_dict = json.loads(fixed)
 
             gc = gspread.service_account_from_dict(creds_dict)
         
-        # 2. INTENTO LOCAL: PC
+        # 2. INTENTO LOCAL
         else:
             gc = gspread.service_account(filename='credentials.json')
 
@@ -49,9 +48,8 @@ def conectar_google():
         return sh.sheet1
 
     except Exception as e:
-        st.error(f"❌ Error de conexión blindada: {e}")
+        st.error(f"❌ Error Fatal: {e}")
         return None
-
 # ================= FUNCIONES AUXILIARES =================
 def crear_recibo_pdf(fecha, cuenta, monto, concepto):
     pdf = FPDF()
@@ -206,3 +204,4 @@ else:
                 st.markdown(href, unsafe_allow_html=True)
     with st.expander("📂 Ver Tabla Detallada de Movimientos"):
         st.dataframe(df_view.style.format({"IMPORTE": "${:,.2f}"}), use_container_width=True)
+
