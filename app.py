@@ -11,29 +11,30 @@ import json
 # ================= CONFIGURACIÓN =================
 st.set_page_config(page_title="Control Financiero Pro", page_icon="💎", layout="wide")
 
-# ================= CONEXIÓN A GOOGLE (REPARADOR DE SALTOS DE LÍNEA) =================
+# ================= CONEXIÓN A GOOGLE (CON CIRUGÍA DE TEXTO) =================
 def conectar_google():
     try:
         # 1. INTENTO NUBE
         if 'gcp_credentials' in st.secrets:
             secret_value = st.secrets['gcp_credentials']
             
-            # Si Streamlit ya lo leyó como diccionario, lo usamos
+            # Si Streamlit ya lo leyó como diccionario, perfecto
             if isinstance(secret_value, dict):
                 creds_dict = secret_value
             else:
-                # Si es texto, intentamos leerlo y REPARARLO si falla
+                # Si es texto, aquí aplicamos la CIRUGÍA
                 try:
                     creds_dict = json.loads(secret_value)
                 except json.JSONDecodeError:
-                    # AQUÍ ESTÁ LA SOLUCIÓN AL ERROR "INVALID CONTROL CHARACTER"
-                    # 1. Reemplazamos saltos de línea reales por "\n"
-                    fixed_string = secret_value.replace('\n', '\\n')
-                    # 2. Reemplazamos tabulaciones por nada
-                    fixed_string = fixed_string.replace('\t', '')
-                    # 3. Leemos con 'strict=False' para ser tolerantes
+                    # ¡AQUÍ ESTÁ LA CURA! 💉
+                    # El error "Invalid control character" se arregla escapando los saltos de línea
+                    fixed_string = secret_value.replace('\n', '\\n')  # Cambia Enter real por \n texto
+                    fixed_string = fixed_string.replace('\t', '')      # Quita tabulaciones raras
+                    
+                    # Leemos el texto ya operado
                     creds_dict = json.loads(fixed_string, strict=False)
 
+            # Conectamos
             gc = gspread.service_account_from_dict(creds_dict)
         
         # 2. INTENTO LOCAL
@@ -88,13 +89,19 @@ def cargar_datos():
     if not hoja: return pd.DataFrame()
     datos = hoja.get_all_records()
     df = pd.DataFrame(datos).astype(str)
+    
+    # Limpieza numérica
     if 'IMPORTE' in df.columns:
         df['IMPORTE'] = pd.to_numeric(df['IMPORTE'], errors='coerce').fillna(0).abs()
+        
+    # Asignación de signos
     if 'TIPO' in df.columns:
         mask_gasto = df['TIPO'].str.strip().str.upper().str.contains('GASTO')
         df.loc[mask_gasto, 'IMPORTE'] *= -1
     else:
         df['IMPORTE'] *= -1 
+        
+    # Fechas
     if 'FECHA' in df.columns:
         df['FECHA'] = pd.to_datetime(df['FECHA'], errors='coerce', dayfirst=True)
         df = df.dropna(subset=['FECHA'])
