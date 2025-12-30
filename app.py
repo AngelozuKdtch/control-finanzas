@@ -11,33 +11,24 @@ import json
 # ================= CONFIGURACIÓN =================
 st.set_page_config(page_title="Control Financiero Pro", page_icon="💎", layout="wide")
 
-# ================= CONEXIÓN A GOOGLE (CON CIRUGÍA DE TEXTO) =================
+# ================= CONEXIÓN A GOOGLE (MÉTODO BLINDADO BASE64) =================
 def conectar_google():
     try:
-        # 1. INTENTO NUBE
-        if 'gcp_credentials' in st.secrets:
-            secret_value = st.secrets['gcp_credentials']
-            
-            # Si Streamlit ya lo leyó como diccionario, perfecto
-            if isinstance(secret_value, dict):
-                creds_dict = secret_value
-            else:
-                # Si es texto, aquí aplicamos la CIRUGÍA
-                try:
-                    creds_dict = json.loads(secret_value)
-                except json.JSONDecodeError:
-                    # ¡AQUÍ ESTÁ LA CURA! 💉
-                    # El error "Invalid control character" se arregla escapando los saltos de línea
-                    fixed_string = secret_value.replace('\n', '\\n')  # Cambia Enter real por \n texto
-                    fixed_string = fixed_string.replace('\t', '')      # Quita tabulaciones raras
-                    
-                    # Leemos el texto ya operado
-                    creds_dict = json.loads(fixed_string, strict=False)
-
-            # Conectamos
-            gc = gspread.service_account_from_dict(creds_dict)
+        # 1. INTENTO NUBE (Usando la llave encriptada)
+        if 'credenciales_seguras' in st.secrets:
+            try:
+                # Decodificamos la llave maestra
+                b64_string = st.secrets['credenciales_seguras']
+                decoded_bytes = base64.b64decode(b64_string)
+                decoded_str = decoded_bytes.decode('utf-8')
+                creds_dict = json.loads(decoded_str)
+                
+                gc = gspread.service_account_from_dict(creds_dict)
+            except Exception as e:
+                st.error(f"❌ Error al decodificar la llave: {e}")
+                return None
         
-        # 2. INTENTO LOCAL
+        # 2. INTENTO LOCAL (PC)
         else:
             gc = gspread.service_account(filename='credentials.json')
 
@@ -45,7 +36,7 @@ def conectar_google():
         return sh.sheet1
 
     except Exception as e:
-        st.error(f"❌ Error de conexión: {e}")
+        st.error(f"❌ Error General de Conexión: {e}")
         st.stop()
         return None
 
@@ -90,18 +81,15 @@ def cargar_datos():
     datos = hoja.get_all_records()
     df = pd.DataFrame(datos).astype(str)
     
-    # Limpieza numérica
     if 'IMPORTE' in df.columns:
         df['IMPORTE'] = pd.to_numeric(df['IMPORTE'], errors='coerce').fillna(0).abs()
         
-    # Asignación de signos
     if 'TIPO' in df.columns:
         mask_gasto = df['TIPO'].str.strip().str.upper().str.contains('GASTO')
         df.loc[mask_gasto, 'IMPORTE'] *= -1
     else:
         df['IMPORTE'] *= -1 
         
-    # Fechas
     if 'FECHA' in df.columns:
         df['FECHA'] = pd.to_datetime(df['FECHA'], errors='coerce', dayfirst=True)
         df = df.dropna(subset=['FECHA'])
