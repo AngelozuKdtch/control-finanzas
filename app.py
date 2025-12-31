@@ -7,9 +7,50 @@ from fpdf import FPDF
 import base64
 from io import BytesIO
 import json
+import time # Nuevo para efectos visuales
 
 # ================= CONFIGURACIÓN =================
-st.set_page_config(page_title="Control Financiero Pro", page_icon="💎", layout="wide")
+st.set_page_config(page_title="Control Financiero Pro", page_icon="🛡️", layout="wide")
+
+# ================= 🔒 SISTEMA DE LOGIN (EL PORTERO) =================
+def check_password():
+    """Retorna True si el usuario ingresó la contraseña correcta."""
+    
+    # 1. Si ya se logueó antes, dejar pasar
+    if st.session_state.get('password_correct', False):
+        return True
+
+    # 2. Mostrar pantalla de Login
+    st.markdown("## 🔐 Acceso Restringido")
+    
+    # Formulario de entrada
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        with st.form("login_form"):
+            user = st.text_input("Usuario", placeholder="Tu usuario")
+            pwd = st.text_input("Contraseña", type="password", placeholder="••••••")
+            submit = st.form_submit_button("Ingresar 🚀")
+            
+            if submit:
+                # Verificar contra los Secretos de Streamlit
+                if user == st.secrets["admin_user"] and pwd == st.secrets["admin_pass"]:
+                    st.session_state['password_correct'] = True
+                    st.toast("¡Acceso Concedido! Bienvenido.", icon="🔓")
+                    time.sleep(1) # Breve pausa para efecto
+                    st.rerun() # Recargar la página para mostrar el contenido
+                else:
+                    st.session_state['password_correct'] = False
+                    st.error("❌ Usuario o contraseña incorrectos")
+
+    return False
+
+# 🛑 ALTO AQUÍ: Si no pasa el login, el código se detiene.
+if not check_password():
+    st.stop()  # Detiene la ejecución. Nadie ve nada debajo de esta línea.
+
+# ====================================================================
+#     ⬇️ ZONA SEGURA: A PARTIR DE AQUÍ ESTÁ TU APP ORIGINAL ⬇️
+# ====================================================================
 
 # ================= CONEXIÓN A GOOGLE (MÉTODO BLINDADO BASE64) =================
 def conectar_google():
@@ -17,24 +58,20 @@ def conectar_google():
         # 1. INTENTO NUBE (Usando la llave encriptada)
         if 'credenciales_seguras' in st.secrets:
             try:
-                # Decodificamos la llave maestra
                 b64_string = st.secrets['credenciales_seguras']
                 decoded_bytes = base64.b64decode(b64_string)
                 decoded_str = decoded_bytes.decode('utf-8')
                 creds_dict = json.loads(decoded_str)
-                
                 gc = gspread.service_account_from_dict(creds_dict)
             except Exception as e:
                 st.error(f"❌ Error al decodificar la llave: {e}")
                 return None
-        
         # 2. INTENTO LOCAL (PC)
         else:
             gc = gspread.service_account(filename='credentials.json')
 
         sh = gc.open("BaseDatos_Maestra")
         return sh.sheet1
-
     except Exception as e:
         st.error(f"❌ Error General de Conexión: {e}")
         st.stop()
@@ -83,13 +120,11 @@ def cargar_datos():
     
     if 'IMPORTE' in df.columns:
         df['IMPORTE'] = pd.to_numeric(df['IMPORTE'], errors='coerce').fillna(0).abs()
-        
     if 'TIPO' in df.columns:
         mask_gasto = df['TIPO'].str.strip().str.upper().str.contains('GASTO')
         df.loc[mask_gasto, 'IMPORTE'] *= -1
     else:
         df['IMPORTE'] *= -1 
-        
     if 'FECHA' in df.columns:
         df['FECHA'] = pd.to_datetime(df['FECHA'], errors='coerce', dayfirst=True)
         df = df.dropna(subset=['FECHA'])
@@ -110,12 +145,20 @@ def guardar_movimiento(banco, fecha, concepto, monto, tipo_real):
             st.error(f"Error al guardar: {e}")
             return False
 
-# ================= INTERFAZ =================
+# ================= INTERFAZ PRINCIPAL =================
+# (Solo se ejecuta si el login fue exitoso)
+
 st.title("💎 Panel de Control Financiero")
+st.markdown(f"Hola **{st.secrets['admin_user']}**, tienes el control.") # Saludo personalizado
+
 df_full = cargar_datos()
 
 # Sidebar
 st.sidebar.header("🎛️ Centro de Mando")
+if st.sidebar.button("🔒 Cerrar Sesión"):
+    st.session_state['password_correct'] = False
+    st.rerun()
+
 hoy = datetime.now()
 inicio_anio = datetime(hoy.year, 1, 1)
 st.sidebar.caption("📅 Periodo de Análisis")
@@ -140,7 +183,7 @@ with st.sidebar.expander("📝 Registrar Movimiento", expanded=False):
                 guardar_movimiento(banco_input, fecha_input, desc_input, monto_input, tipo_input)
                 st.rerun()
 
-# Panel Principal
+# Panel Principal Dashboard
 if df_full.empty:
     st.info("👋 Parece que no hay datos. Sube tu Excel o registra un movimiento.")
 else:
