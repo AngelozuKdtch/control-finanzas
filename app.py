@@ -2,31 +2,29 @@ import streamlit as st
 import pandas as pd
 import gspread
 import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime, date, timedelta
-from fpdf import FPDF
+import calendar
 import base64
 from io import BytesIO
 import json
 import time
-import requests # <--- NUEVO: Para hablar con Telegram
+import requests
 
-# ================= CONFIGURACIÓN VISUAL =================
-st.set_page_config(page_title="Finanzas Master v4", page_icon="🤖", layout="wide")
+# ================= CONFIGURACIÓN =================
+st.set_page_config(page_title="Asistente Financiero IA", page_icon="📅", layout="wide")
 
-# ================= 🔒 LOGIN BLINDADO =================
+# ================= 🔒 LOGIN =================
 def check_password():
     if st.session_state.get('password_correct', False):
         return True
     
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
-        st.markdown("### 💎 Acceso al Sistema Financiero")
+        st.markdown("### 🔐 Acceso Seguro")
         with st.form("login_form"):
             user = st.text_input("Usuario")
             pwd = st.text_input("Contraseña", type="password")
             if st.form_submit_button("Entrar"):
-                # Verificamos secretos
                 if user == st.secrets.get("admin_user", "admin") and pwd == st.secrets.get("admin_pass", "1234"):
                     st.session_state['password_correct'] = True
                     st.rerun()
@@ -37,7 +35,7 @@ def check_password():
 if not check_password():
     st.stop()
 
-# ================= CONEXIÓN Y DATOS =================
+# ================= CONEXIÓN GOOGLE =================
 def conectar_google():
     try:
         if 'credenciales_seguras' in st.secrets:
@@ -48,344 +46,196 @@ def conectar_google():
             gc = gspread.service_account(filename='credentials.json')
         return gc.open("BaseDatos_Maestra")
     except Exception as e:
-        st.error(f"Error crítico de conexión: {e}")
+        st.error(f"Error conexión: {e}")
         st.stop()
 
-@st.cache_data(ttl=5)
-def cargar_todo():
-    sh = conectar_google()
+# ================= 🧠 MOTOR DE FECHAS INTELIGENTE =================
+def calcular_proxima_fecha(dia_objetivo):
+    """
+    Calcula la próxima fecha válida para un día específico (ej: día 30),
+    ajustándose si el mes actual no tiene ese día (ej: febrero).
+    """
+    if not dia_objetivo or dia_objetivo == 0: return None
     
-    # 1. MOVIMIENTOS
-    df_movs = pd.DataFrame(sh.sheet1.get_all_records()).astype(str)
-    if not df_movs.empty:
-        if 'IMPORTE' in df_movs.columns:
-            df_movs['IMPORTE'] = pd.to_numeric(df_movs['IMPORTE'], errors='coerce').fillna(0).abs()
-        if 'FECHA' in df_movs.columns:
-            df_movs['FECHA'] = pd.to_datetime(df_movs['FECHA'], errors='coerce', dayfirst=True)
-            df_movs = df_movs.dropna(subset=['FECHA'])
-        
-        df_movs['IMPORTE_REAL'] = df_movs['IMPORTE']
-        if 'TIPO' in df_movs.columns:
-            mask_gasto = df_movs['TIPO'].str.upper().str.contains('GASTO')
-            df_movs.loc[mask_gasto, 'IMPORTE_REAL'] *= -1
-        else:
-            df_movs['IMPORTE_REAL'] *= -1
-
-    # 2. INVERSIONES
+    hoy = datetime.now().date()
+    anio = hoy.year
+    mes = hoy.month
+    
+    # Intentamos crear la fecha en el mes actual
     try:
-        df_inv = pd.DataFrame(sh.worksheet("Inversiones").get_all_records())
-        if not df_inv.empty:
-            cols_num = ['MONTO_INICIAL', 'TASA_ANUAL']
-            for col in cols_num:
-                if col in df_inv.columns:
-                    df_inv[col] = pd.to_numeric(df_inv[col], errors='coerce').fillna(0)
-            df_inv['FECHA_INICIO'] = pd.to_datetime(df_inv['FECHA_INICIO'], errors='coerce', dayfirst=True)
+        # Función para obtener el último día válido del mes
+        _, ultimo_dia_mes = calendar.monthrange(anio, mes)
+        dia_ajustado = min(int(dia_objetivo), ultimo_dia_mes)
+        fecha_tentativa = date(anio, mes, dia_ajustado)
     except:
-        df_inv = pd.DataFrame()
+        fecha_tentativa = hoy # Fallback
 
-    # 3. DEUDAS
+    # Si la fecha ya pasó este mes, nos vamos al siguiente
+    if fecha_tentativa < hoy:
+        mes += 1
+        if mes > 12:
+            mes = 1
+            anio += 1
+        _, ultimo_dia_mes = calendar.monthrange(anio, mes)
+        dia_ajustado = min(int(dia_objetivo), ultimo_dia_mes)
+        fecha_tentativa = date(anio, mes, dia_ajustado)
+        
+    return fecha_tentativa
+
+def cargar_datos_procesados(sh):
+    # 1. Movimientos
+    try:
+        df_movs = pd.DataFrame(sh.sheet1.get_all_records()).astype(str)
+        if not df_movs.empty:
+            df_movs['IMPORTE'] = pd.to_numeric(df_movs['IMPORTE'], errors='coerce').fillna(0).abs()
+            df_movs['FECHA'] = pd.to_datetime(df_movs['FECHA'], errors='coerce', dayfirst=True)
+            df_movs['IMPORTE_REAL'] = df_movs.apply(lambda x: -x['IMPORTE'] if 'GASTO' in str(x['TIPO']).upper() else x['IMPORTE'], axis=1)
+    except: df_movs = pd.DataFrame()
+
+    # 2. Deudas con Lógica Cíclica
+    alertas = []
+    calendario_pagos = []
+    
     try:
         df_deudas = pd.DataFrame(sh.worksheet("Deudas").get_all_records())
         if not df_deudas.empty:
-            cols_num = ['MONTO_TOTAL', 'ABONADO']
-            for col in cols_num:
-                if col in df_deudas.columns:
-                    df_deudas[col] = pd.to_numeric(df_deudas[col], errors='coerce').fillna(0)
-    except:
-        df_deudas = pd.DataFrame() 
+            df_deudas['MONTO_A_PAGAR'] = pd.to_numeric(df_deudas['MONTO_A_PAGAR'], errors='coerce').fillna(0)
+            
+            for idx, row in df_deudas.iterrows():
+                if row['ESTADO'] != 'Activo': continue
+                
+                nombre = row['NOMBRE']
+                tipo = row['TIPO']
+                monto = row['MONTO_A_PAGAR']
+                
+                # A) LÓGICA CÍCLICA (Tarjetas)
+                if "Tarjeta" in tipo or (row.get('DIA_PAGO') and str(row['DIA_PAGO']).isdigit()):
+                    dia_corte = int(row['DIA_CORTE']) if str(row['DIA_CORTE']).isdigit() else None
+                    dia_pago = int(row['DIA_PAGO']) if str(row['DIA_PAGO']).isdigit() else None
+                    
+                    prox_corte = calcular_proxima_fecha(dia_corte)
+                    prox_pago = calcular_proxima_fecha(dia_pago)
+                    
+                    if prox_pago:
+                        dias_rest = (prox_pago - datetime.now().date()).days
+                        calendario_pagos.append({"Fecha": prox_pago, "Evento": f"Pago {nombre}", "Monto": monto, "Tipo": "Pago"})
+                        
+                        if 0 <= dias_rest <= 5:
+                            alertas.append(f"🔥 **{nombre}**: Pagar antes del {prox_pago.strftime('%d/%m')} (Faltan {dias_rest} días)")
+                    
+                    if prox_corte:
+                        calendario_pagos.append({"Fecha": prox_corte, "Evento": f"Corte {nombre}", "Monto": 0, "Tipo": "Corte"})
 
-    return df_movs, df_inv, df_deudas, sh
+                # B) LÓGICA ÚNICA (Préstamos)
+                else:
+                    try:
+                        fecha_venc = pd.to_datetime(row['FECHA_VENCIMIENTO']).date()
+                        dias_rest = (fecha_venc - datetime.now().date()).days
+                        calendario_pagos.append({"Fecha": fecha_venc, "Evento": f"Vence {nombre}", "Monto": monto, "Tipo": "Vencimiento"})
+                        
+                        if 0 <= dias_rest <= 5:
+                            alertas.append(f"⚠️ **{nombre}**: Vence el {fecha_venc.strftime('%d/%m')} (Faltan {dias_rest} días)")
+                        elif dias_rest < 0:
+                            alertas.append(f"☠️ **{nombre}**: VENCIDO hace {abs(dias_rest)} días")
+                    except: pass
+                    
+    except Exception as e:
+        st.error(f"Error procesando deudas: {e}")
+        df_deudas = pd.DataFrame()
 
-# ================= FUNCIONES AUXILIARES =================
-def generar_pdf(fecha, cuenta, monto, concepto):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, "COMPROBANTE DE PAGO", ln=1, align='C')
-    pdf.ln(10)
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 10, f"Fecha: {fecha}", ln=1)
-    pdf.cell(0, 10, f"Concepto: {concepto}", ln=1)
-    pdf.cell(0, 10, f"Monto: ${monto:,.2f}", ln=1)
-    pdf.cell(0, 10, f"Cuenta: {cuenta}", ln=1)
-    return pdf.output(dest='S').encode('latin-1')
-
-def descargar_excel(df):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False)
-    return output.getvalue()
+    return df_movs, df_deudas, alertas, calendario_pagos, sh
 
 def guardar_registro(sh, hoja, datos):
     try:
-        ws = sh.worksheet(hoja)
-        ws.append_row(datos)
+        sh.worksheet(hoja).append_row(datos)
         st.cache_data.clear()
         return True
-    except Exception as e:
-        st.error(f"Error al guardar: {e}")
-        return False
+    except: return False
 
-# === NUEVO: CEREBRO DEL BOT DE TELEGRAM ===
-def procesar_telegram(sh):
-    TOKEN = st.secrets.get("telegram_token")
-    MY_ID = str(st.secrets.get("telegram_user_id"))
-    
-    if not TOKEN or not MY_ID:
-        st.error("Faltan configurar los Secretos de Telegram")
-        return
+# ================= INTERFAZ =================
+df_movs, df_deudas, alertas, calendario, sh_obj = cargar_datos_procesados(conectar_google())
 
-    # 1. Obtener actualizaciones
-    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-    try:
-        # Usamos offset para no leer mensajes viejos repetidos (lógica simple)
-        response = requests.get(url)
-        data = response.json()
-        
-        if not data['ok']:
-            st.error("Telegram no responde")
-            return
-
-        mensajes = data['result']
-        mensajes_procesados = 0
-        
-        # Leemos del último al primero, pero solo los nuevos
-        for m in mensajes:
-            update_id = m['update_id']
-            # Confirmamos lectura para que Telegram lo borre de la cola
-            requests.get(f"{url}?offset={update_id + 1}")
-            
-            chat_id = str(m['message']['chat']['id'])
-            texto = m['message'].get('text', '').lower().strip()
-            
-            # SEGURIDAD: Solo obedecer a TU ID
-            if chat_id != MY_ID:
-                continue
-                
-            # LÓGICA DE INTERPRETACIÓN
-            # Formato esperado: "gasto 50 tacos" o "ingreso 500 nomina"
-            partes = texto.split(" ")
-            
-            if len(partes) >= 3:
-                tipo_cmd = partes[0] # gasto / ingreso
-                try:
-                    monto = float(partes[1])
-                    concepto = " ".join(partes[2:])
-                    hoy = datetime.now().strftime("%Y-%m-%d")
-                    
-                    if "gasto" in tipo_cmd:
-                        datos = ["Telegram", hoy, concepto, monto, "-", "-", "Gasto", "Efectivo"]
-                        guardar_registro(sh, "Hoja 1", datos)
-                        responder_telegram(TOKEN, chat_id, f"✅ Gasto anotado: ${monto} en {concepto}")
-                        mensajes_procesados += 1
-                        
-                    elif "ingreso" in tipo_cmd or "pago" in tipo_cmd:
-                        datos = ["Telegram", hoy, concepto, monto, "-", "-", "Pago", "Efectivo"]
-                        guardar_registro(sh, "Hoja 1", datos)
-                        responder_telegram(TOKEN, chat_id, f"💰 Ingreso anotado: ${monto} de {concepto}")
-                        mensajes_procesados += 1
-                        
-                except ValueError:
-                    responder_telegram(TOKEN, chat_id, "⚠️ Error: El monto debe ser número. Ej: 'gasto 50 tacos'")
-            else:
-                # Si solo dice "Hola" o cosas raras
-                responder_telegram(TOKEN, chat_id, "🤖 Soy tu Mayordomo Financiero.\nUsa: 'gasto 100 comida' o 'ingreso 500 venta'")
-        
-        if mensajes_procesados > 0:
-            st.toast(f"🤖 Se importaron {mensajes_procesados} movimientos de Telegram", icon="✅")
-            time.sleep(1)
-            st.rerun()
-        else:
-            st.toast("No hay mensajes nuevos en Telegram", icon="💤")
-            
-    except Exception as e:
-        st.error(f"Error bot: {e}")
-
-def responder_telegram(token, chat_id, mensaje):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": mensaje}
-    requests.post(url, json=payload)
-
-def procesar_abono(sh, nombre_deuda, monto_abono, cuenta_bancaria):
-    try:
-        ws_deudas = sh.worksheet("Deudas")
-        datos_deudas = ws_deudas.get_all_records()
-        fila_idx = -1
-        deuda_info = None
-        for i, d in enumerate(datos_deudas):
-            if d['QUIEN'] == nombre_deuda and d['ESTADO'] == 'Activo':
-                fila_idx = i + 2
-                deuda_info = d
-                break
-        if fila_idx == -1: return
-
-        nuevo_abonado = float(deuda_info['ABONADO']) + monto_abono
-        ws_deudas.update_cell(fila_idx, 4, nuevo_abonado)
-        if nuevo_abonado >= float(deuda_info['MONTO_TOTAL']):
-            ws_deudas.update_cell(fila_idx, 6, "Pagado")
-            st.balloons()
-            
-        hoy = datetime.now().strftime("%Y-%m-%d")
-        etiqueta = "Gasto" if deuda_info['TIPO'] == "Debo Yo" else "Pago"
-        guardar_registro(sh, "Hoja 1", ["Manual", hoy, f"Abono: {nombre_deuda}", monto_abono, "-", "-", etiqueta, cuenta_bancaria])
-            
-    except Exception as e:
-        st.error(f"Error abono: {e}")
-
-# ================= INTERFAZ PRINCIPAL =================
-df_movs, df_inv, df_deudas, sh_obj = cargar_todo()
-
+# --- SIDEBAR ---
 with st.sidebar:
-    st.title("🎛️ Centro de Mando")
-    st.caption(f"Usuario: {st.secrets.get('admin_user','Admin')}")
+    st.title("🎛️ Panel de Control")
+    st.caption("v5.0 - Motor Cíclico Activo")
     
-    # BOTÓN DE SINCRONIZACIÓN
-    st.markdown("### 🤖 El Mayordomo")
-    if st.button("🔄 Sincronizar Telegram"):
-        with st.spinner("Leyendo mensajes..."):
-            procesar_telegram(sh_obj)
+    # Nuevo Registro Inteligente
+    with st.expander("📝 Nuevo Compromiso"):
+        with st.form("nuevo_comp"):
+            c_nombre = st.text_input("Nombre (ej: Tarjeta Oro)")
+            c_tipo = st.selectbox("Tipo", ["Tarjeta Crédito (Cíclico)", "Préstamo Único"])
+            c_monto = st.number_input("Monto / Pago Mensual", min_value=0.0)
             
-    st.divider()
-
-    # Filtros
-    hoy = datetime.now()
-    f_inicio = st.date_input("Desde", date(hoy.year, 1, 1))
-    f_fin = st.date_input("Hasta", hoy)
-    cuentas_lista = sorted(list(df_movs['BANCO'].unique())) if not df_movs.empty else ["Efectivo"]
-    filtro_cuenta = st.selectbox("Filtrar Cuenta", ["Todas"] + cuentas_lista)
-    
-    st.divider()
-    
-    # ACCIONES
-    with st.expander("💸 Nuevo Gasto / Ingreso"):
-        with st.form("form_gasto"):
-            tipo = st.radio("Tipo", ["Gasto (Salida)", "Ingreso (Pago)"])
-            monto = st.number_input("Monto $", min_value=0.0)
-            desc = st.text_input("Concepto")
-            cta = st.selectbox("Cuenta", cuentas_lista + ["Nueva..."])
-            fecha = st.date_input("Fecha", hoy)
-            if st.form_submit_button("Guardar"):
-                etiqueta = "Gasto" if tipo == "Gasto (Salida)" else "Pago"
-                if guardar_registro(sh_obj, "Hoja 1", ["Manual", str(fecha), desc, monto, "-", "-", etiqueta, cta]):
-                    st.rerun()
-
-    with st.expander("💳 Abonar Deuda"):
-        if not df_deudas.empty:
-            deudas_activas = df_deudas[df_deudas['ESTADO'] == 'Activo']['QUIEN'].tolist()
-            with st.form("form_abono"):
-                d_selec = st.selectbox("Deuda", deudas_activas)
-                a_monto = st.number_input("Monto", min_value=0.0)
-                a_cta = st.selectbox("Cuenta", cuentas_lista)
-                if st.form_submit_button("Abonar"):
-                    procesar_abono(sh_obj, d_selec, a_monto, a_cta)
-                    st.rerun()
-
-    with st.expander("🤝 Nueva Deuda"):
-        with st.form("form_deuda"):
-            quien = st.text_input("Persona / Banco")
-            d_tipo = st.selectbox("Tipo", ["Debo Yo", "Me Deben"])
-            d_monto = st.number_input("Monto Total", min_value=0.0)
-            if st.form_submit_button("Crear"):
-                if guardar_registro(sh_obj, "Deudas", [quien, d_tipo, d_monto, 0, str(hoy + timedelta(days=30)), "Activo"]):
-                    st.rerun()
-
-    with st.expander("📈 Nueva Inversión"):
-        with st.form("form_inv"):
-            plat = st.selectbox("Plataforma", ["Nu", "Cetes", "GBM", "Banco"])
-            prod = st.text_input("Producto")
-            m_inv = st.number_input("Monto", min_value=0.0)
-            tasa = st.number_input("Tasa %", value=15.0)
-            if st.form_submit_button("Guardar"):
-                if guardar_registro(sh_obj, "Inversiones", [plat, prod, str(hoy), m_inv, tasa, str(hoy + timedelta(days=365))]):
-                    st.rerun()
-    
-    if st.button("🔒 Salir"):
-        st.session_state['password_correct'] = False
-        st.rerun()
-
-# --- LÓGICA DE DATOS ---
-df_filtrado = df_movs.copy()
-if not df_filtrado.empty:
-    mask = (df_filtrado['FECHA'].dt.date >= f_inicio) & (df_filtrado['FECHA'].dt.date <= f_fin)
-    df_filtrado = df_filtrado.loc[mask]
-    if filtro_cuenta != "Todas":
-        df_filtrado = df_filtrado[df_filtrado['BANCO'] == filtro_cuenta]
-
-# --- PESTAÑAS ---
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Resumen", "📝 Detalle", "🚀 Inversiones", "🤝 Deudas"])
-
-# TAB 1: RESUMEN
-with tab1:
-    st.subheader("Visión General")
-    saldo_liquido = df_movs['IMPORTE_REAL'].sum() if not df_movs.empty else 0
-    valor_inv = 0
-    if not df_inv.empty:
-        for _, row in df_inv.iterrows():
-            dias = (hoy - row['FECHA_INICIO']).days
-            val = row['MONTO_INICIAL'] * ((1 + ((row['TASA_ANUAL']/100)/365)) ** max(dias, 0))
-            valor_inv += val
+            col_a, col_b = st.columns(2)
+            if "Tarjeta" in c_tipo:
+                dia_corte = col_a.number_input("Día de Corte", 1, 31, 15)
+                dia_pago = col_b.number_input("Día Límite Pago", 1, 31, 5)
+                fecha_venc = ""
+            else:
+                dia_corte = ""
+                dia_pago = ""
+                fecha_venc = st.date_input("Fecha Vencimiento")
             
-    k1, k2, k3 = st.columns(3)
-    k1.metric("🏛️ Patrimonio", f"${saldo_liquido + valor_inv:,.2f}")
-    k2.metric("💵 Liquidez", f"${saldo_liquido:,.2f}")
-    k3.metric("📈 Inversiones", f"${valor_inv:,.2f}")
+            if st.form_submit_button("Guardar"):
+                # Guarda en formato compatible con la hoja
+                guardar_registro(sh_obj, "Deudas", [c_nombre, c_tipo, c_monto, dia_corte, dia_pago, str(fecha_venc), "Activo"])
+                st.toast("Guardado exitosamente")
+                time.sleep(1)
+                st.rerun()
+
+# --- ALERTAS INTELIGENTES ---
+st.subheader(f"Hola, {st.secrets.get('admin_user','Admin')}")
+
+if alertas:
+    for a in alertas:
+        if "🔥" in a: st.error(a)
+        elif "⚠️" in a: st.warning(a)
+        else: st.info(a)
+else:
+    st.success("✅ Todo tranquilo. No hay vencimientos urgentes en los próximos 5 días.")
+
+st.divider()
+
+# --- CALENDARIO VISUAL ---
+st.markdown("### 📅 Tu Calendario Financiero")
+
+if calendario:
+    df_cal = pd.DataFrame(calendario).sort_values("Fecha")
     
-    st.divider()
-    st.markdown("### 🎯 Presupuesto")
-    presupuesto = st.number_input("Presupuesto", value=5000, step=500)
-    gastos = abs(df_filtrado[df_filtrado['IMPORTE_REAL'] < 0]['IMPORTE_REAL'].sum())
-    st.progress(min(gastos / presupuesto, 1.0) if presupuesto > 0 else 0)
-    st.caption(f"Gastado: ${gastos:,.2f} / ${presupuesto:,.2f}")
-
-# TAB 2: DETALLE
-with tab2:
-    col_d1, col_d2 = st.columns([3,1])
-    with col_d1:
-        st.dataframe(df_filtrado[['FECHA', 'DESCRIPCION', 'IMPORTE_REAL', 'BANCO', 'TIPO']].sort_values('FECHA', ascending=False), use_container_width=True)
-    with col_d2:
-        if not df_filtrado.empty:
-            excel_data = descargar_excel(df_filtrado)
-            st.download_button("📥 Excel", excel_data, "Reporte.xlsx")
-            st.divider()
-            st.write("Generar Recibo")
-            opcion = st.selectbox("Movimiento:", df_filtrado.index, format_func=lambda x: f"{df_filtrado.loc[x, 'DESCRIPCION']} (${df_filtrado.loc[x, 'IMPORTE']})")
-            if st.button("PDF"):
-                r = df_filtrado.loc[opcion]
-                pdf = generar_pdf(str(r['FECHA'].date()), r['BANCO'], r['IMPORTE'], r['DESCRIPCION'])
-                b64 = base64.b64encode(pdf).decode()
-                st.markdown(f'<a href="data:application/pdf;base64,{b64}" download="Recibo.pdf">Descargar PDF</a>', unsafe_allow_html=True)
-
-# TAB 3: INVERSIONES
-with tab3:
-    if not df_inv.empty:
-        df_inv['VALOR_HOY'] = df_inv.apply(lambda r: r['MONTO_INICIAL'] * ((1 + ((r['TASA_ANUAL']/100)/365)) ** max((hoy - r['FECHA_INICIO']).days, 0)), axis=1)
-        fig = px.bar(df_inv, x='PLATAFORMA', y='VALOR_HOY', color='PRODUCTO', title="Crecimiento de Inversiones")
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df_inv[['PLATAFORMA', 'PRODUCTO', 'MONTO_INICIAL', 'VALOR_HOY']])
-    else:
-        st.info("Sin inversiones.")
-
-# TAB 4: DEUDAS
-with tab4:
-    if not df_deudas.empty:
-        c1, c2 = st.columns(2)
-        debo = df_deudas[df_deudas['TIPO'] == "Debo Yo"]
-        me_deben = df_deudas[df_deudas['TIPO'] == "Me Deben"]
+    # Creamos columnas para simular un calendario lista
+    for i, row in df_cal.iterrows():
+        hoy = datetime.now().date()
+        delta = (row['Fecha'] - hoy).days
         
-        with c1:
-            st.error(f"🔴 Yo Debo: ${debo['MONTO_TOTAL'].sum() - debo['ABONADO'].sum():,.2f}")
-            for _, d in debo.iterrows():
-                resta = d['MONTO_TOTAL'] - d['ABONADO']
-                if resta > 0:
-                    st.write(f"**{d['QUIEN']}**: Restan ${resta:,.2f}")
-                    st.progress(d['ABONADO']/d['MONTO_TOTAL'])
-                    
-        with c2:
-            st.success(f"🟢 Me Deben: ${me_deben['MONTO_TOTAL'].sum() - me_deben['ABONADO'].sum():,.2f}")
-            for _, d in me_deben.iterrows():
-                resta = d['MONTO_TOTAL'] - d['ABONADO']
-                if resta > 0:
-                    st.write(f"**{d['QUIEN']}**: Restan ${resta:,.2f}")
-                    st.progress(d['ABONADO']/d['MONTO_TOTAL'])
-    else:
-        st.info("Sin deudas.")
+        # Estilos visuales según cercanía
+        if delta < 0: color = "gray"
+        elif delta == 0: color = "#FF4B4B" # Hoy
+        elif delta <= 7: color = "#FFA726" # Esta semana
+        else: color = "#66BB6A" # Futuro
+        
+        with st.container():
+            c1, c2, c3, c4 = st.columns([1, 4, 2, 2])
+            c1.markdown(f"**{row['Fecha'].strftime('%d %b')}**")
+            c2.write(f"{'🔴' if row['Tipo']=='Pago' else '✂️'} {row['Evento']}")
+            if row['Monto'] > 0:
+                c3.write(f"**${row['Monto']:,.2f}**")
+            else:
+                c3.write("-")
+            
+            # Botón de acción rápida (simulado)
+            if delta >= 0:
+                c4.caption(f"En {delta} días")
+            else:
+                c4.caption("Pasado")
+            
+            st.markdown(f"<div style='height:2px; background-color:{color}; margin-bottom:10px;'></div>", unsafe_allow_html=True)
+
+else:
+    st.info("No hay eventos próximos. Agrega deudas o tarjetas en el menú lateral.")
+
+# --- SECCIÓN DE GASTOS DIARIOS ---
+st.divider()
+st.markdown("### 💸 Movimientos Recientes")
+if not df_movs.empty:
+    st.dataframe(df_movs.sort_values('FECHA', ascending=False).head(5), use_container_width=True)
