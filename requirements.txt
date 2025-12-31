@@ -4,3 +4,4 @@ gspread
 plotly
 fpdf
 xlsxwriter
+requests
