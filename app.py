@@ -9,9 +9,10 @@ import base64
 from io import BytesIO
 import json
 import time
+import requests # <--- NUEVO: Para hablar con Telegram
 
 # ================= CONFIGURACIÓN VISUAL =================
-st.set_page_config(page_title="Finanzas Master v3.5", page_icon="💎", layout="wide")
+st.set_page_config(page_title="Finanzas Master v4", page_icon="🤖", layout="wide")
 
 # ================= 🔒 LOGIN BLINDADO =================
 def check_password():
@@ -54,7 +55,7 @@ def conectar_google():
 def cargar_todo():
     sh = conectar_google()
     
-    # 1. MOVIMIENTOS (Hoja 1)
+    # 1. MOVIMIENTOS
     df_movs = pd.DataFrame(sh.sheet1.get_all_records()).astype(str)
     if not df_movs.empty:
         if 'IMPORTE' in df_movs.columns:
@@ -63,7 +64,6 @@ def cargar_todo():
             df_movs['FECHA'] = pd.to_datetime(df_movs['FECHA'], errors='coerce', dayfirst=True)
             df_movs = df_movs.dropna(subset=['FECHA'])
         
-        # Crear columna de importe real (Negativo para gastos)
         df_movs['IMPORTE_REAL'] = df_movs['IMPORTE']
         if 'TIPO' in df_movs.columns:
             mask_gasto = df_movs['TIPO'].str.upper().str.contains('GASTO')
@@ -71,7 +71,7 @@ def cargar_todo():
         else:
             df_movs['IMPORTE_REAL'] *= -1
 
-    # 2. INVERSIONES (Hoja 'Inversiones')
+    # 2. INVERSIONES
     try:
         df_inv = pd.DataFrame(sh.worksheet("Inversiones").get_all_records())
         if not df_inv.empty:
@@ -83,7 +83,7 @@ def cargar_todo():
     except:
         df_inv = pd.DataFrame()
 
-    # 3. DEUDAS (Hoja 'Deudas')
+    # 3. DEUDAS
     try:
         df_deudas = pd.DataFrame(sh.worksheet("Deudas").get_all_records())
         if not df_deudas.empty:
@@ -120,86 +120,143 @@ def guardar_registro(sh, hoja, datos):
     try:
         ws = sh.worksheet(hoja)
         ws.append_row(datos)
-        st.toast(f"✅ Guardado en {hoja}", icon="💾")
         st.cache_data.clear()
-        time.sleep(1)
-        st.rerun()
+        return True
     except Exception as e:
         st.error(f"Error al guardar: {e}")
+        return False
 
-# === NUEVA FUNCIÓN: PROCESAR ABONO ===
+# === NUEVO: CEREBRO DEL BOT DE TELEGRAM ===
+def procesar_telegram(sh):
+    TOKEN = st.secrets.get("telegram_token")
+    MY_ID = str(st.secrets.get("telegram_user_id"))
+    
+    if not TOKEN or not MY_ID:
+        st.error("Faltan configurar los Secretos de Telegram")
+        return
+
+    # 1. Obtener actualizaciones
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+    try:
+        # Usamos offset para no leer mensajes viejos repetidos (lógica simple)
+        response = requests.get(url)
+        data = response.json()
+        
+        if not data['ok']:
+            st.error("Telegram no responde")
+            return
+
+        mensajes = data['result']
+        mensajes_procesados = 0
+        
+        # Leemos del último al primero, pero solo los nuevos
+        for m in mensajes:
+            update_id = m['update_id']
+            # Confirmamos lectura para que Telegram lo borre de la cola
+            requests.get(f"{url}?offset={update_id + 1}")
+            
+            chat_id = str(m['message']['chat']['id'])
+            texto = m['message'].get('text', '').lower().strip()
+            
+            # SEGURIDAD: Solo obedecer a TU ID
+            if chat_id != MY_ID:
+                continue
+                
+            # LÓGICA DE INTERPRETACIÓN
+            # Formato esperado: "gasto 50 tacos" o "ingreso 500 nomina"
+            partes = texto.split(" ")
+            
+            if len(partes) >= 3:
+                tipo_cmd = partes[0] # gasto / ingreso
+                try:
+                    monto = float(partes[1])
+                    concepto = " ".join(partes[2:])
+                    hoy = datetime.now().strftime("%Y-%m-%d")
+                    
+                    if "gasto" in tipo_cmd:
+                        datos = ["Telegram", hoy, concepto, monto, "-", "-", "Gasto", "Efectivo"]
+                        guardar_registro(sh, "Hoja 1", datos)
+                        responder_telegram(TOKEN, chat_id, f"✅ Gasto anotado: ${monto} en {concepto}")
+                        mensajes_procesados += 1
+                        
+                    elif "ingreso" in tipo_cmd or "pago" in tipo_cmd:
+                        datos = ["Telegram", hoy, concepto, monto, "-", "-", "Pago", "Efectivo"]
+                        guardar_registro(sh, "Hoja 1", datos)
+                        responder_telegram(TOKEN, chat_id, f"💰 Ingreso anotado: ${monto} de {concepto}")
+                        mensajes_procesados += 1
+                        
+                except ValueError:
+                    responder_telegram(TOKEN, chat_id, "⚠️ Error: El monto debe ser número. Ej: 'gasto 50 tacos'")
+            else:
+                # Si solo dice "Hola" o cosas raras
+                responder_telegram(TOKEN, chat_id, "🤖 Soy tu Mayordomo Financiero.\nUsa: 'gasto 100 comida' o 'ingreso 500 venta'")
+        
+        if mensajes_procesados > 0:
+            st.toast(f"🤖 Se importaron {mensajes_procesados} movimientos de Telegram", icon="✅")
+            time.sleep(1)
+            st.rerun()
+        else:
+            st.toast("No hay mensajes nuevos en Telegram", icon="💤")
+            
+    except Exception as e:
+        st.error(f"Error bot: {e}")
+
+def responder_telegram(token, chat_id, mensaje):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": mensaje}
+    requests.post(url, json=payload)
+
 def procesar_abono(sh, nombre_deuda, monto_abono, cuenta_bancaria):
     try:
         ws_deudas = sh.worksheet("Deudas")
         datos_deudas = ws_deudas.get_all_records()
-        
-        # 1. Buscar la fila de la deuda
         fila_idx = -1
         deuda_info = None
-        
         for i, d in enumerate(datos_deudas):
             if d['QUIEN'] == nombre_deuda and d['ESTADO'] == 'Activo':
-                fila_idx = i + 2 # +2 porque sheets empieza en 1 y tiene encabezado
+                fila_idx = i + 2
                 deuda_info = d
                 break
-        
-        if fila_idx == -1:
-            st.error("No se encontró la deuda activa.")
-            return
+        if fila_idx == -1: return
 
-        # 2. Calcular nuevos valores
         nuevo_abonado = float(deuda_info['ABONADO']) + monto_abono
-        monto_total = float(deuda_info['MONTO_TOTAL'])
-        
-        # 3. Actualizar Hoja Deudas
-        # Columna 4 es ABONADO
         ws_deudas.update_cell(fila_idx, 4, nuevo_abonado)
-        
-        # Si se completó, cambiar estado a Pagado (Columna 6)
-        estado_final = "Activo"
-        if nuevo_abonado >= monto_total:
+        if nuevo_abonado >= float(deuda_info['MONTO_TOTAL']):
             ws_deudas.update_cell(fila_idx, 6, "Pagado")
-            estado_final = "Pagado"
             st.balloons()
             
-        # 4. Registrar el movimiento de dinero en Hoja 1
         hoy = datetime.now().strftime("%Y-%m-%d")
-        
-        if deuda_info['TIPO'] == "Debo Yo":
-            # Si yo pago, sale dinero de mi cuenta (Gasto)
-            concepto = f"Abono a deuda: {nombre_deuda}"
-            guardar_registro(sh, "Hoja 1", ["Manual", hoy, concepto, monto_abono, "-", "-", "Gasto", cuenta_bancaria])
-            
-        elif deuda_info['TIPO'] == "Me Deben":
-            # Si me pagan, entra dinero a mi cuenta (Ingreso)
-            concepto = f"Cobro a: {nombre_deuda}"
-            guardar_registro(sh, "Hoja 1", ["Manual", hoy, concepto, monto_abono, "-", "-", "Pago", cuenta_bancaria])
+        etiqueta = "Gasto" if deuda_info['TIPO'] == "Debo Yo" else "Pago"
+        guardar_registro(sh, "Hoja 1", ["Manual", hoy, f"Abono: {nombre_deuda}", monto_abono, "-", "-", etiqueta, cuenta_bancaria])
             
     except Exception as e:
-        st.error(f"Error procesando abono: {e}")
+        st.error(f"Error abono: {e}")
 
 # ================= INTERFAZ PRINCIPAL =================
 df_movs, df_inv, df_deudas, sh_obj = cargar_todo()
 
-# --- SIDEBAR: CENTRO DE MANDO ---
 with st.sidebar:
     st.title("🎛️ Centro de Mando")
     st.caption(f"Usuario: {st.secrets.get('admin_user','Admin')}")
     
-    # Filtros Globales
+    # BOTÓN DE SINCRONIZACIÓN
+    st.markdown("### 🤖 El Mayordomo")
+    if st.button("🔄 Sincronizar Telegram"):
+        with st.spinner("Leyendo mensajes..."):
+            procesar_telegram(sh_obj)
+            
+    st.divider()
+
+    # Filtros
     hoy = datetime.now()
     f_inicio = st.date_input("Desde", date(hoy.year, 1, 1))
     f_fin = st.date_input("Hasta", hoy)
-    
     cuentas_lista = sorted(list(df_movs['BANCO'].unique())) if not df_movs.empty else ["Efectivo"]
     filtro_cuenta = st.selectbox("Filtrar Cuenta", ["Todas"] + cuentas_lista)
     
     st.divider()
     
-    # --- MENÚ DE ACCIONES RÁPIDAS ---
-    st.subheader("⚡ Acciones Rápidas")
-    
-    # 1. Registrar Gasto/Ingreso
+    # ACCIONES
     with st.expander("💸 Nuevo Gasto / Ingreso"):
         with st.form("form_gasto"):
             tipo = st.radio("Tipo", ["Gasto (Salida)", "Ingreso (Pago)"])
@@ -207,47 +264,41 @@ with st.sidebar:
             desc = st.text_input("Concepto")
             cta = st.selectbox("Cuenta", cuentas_lista + ["Nueva..."])
             fecha = st.date_input("Fecha", hoy)
-            if st.form_submit_button("Guardar Movimiento"):
+            if st.form_submit_button("Guardar"):
                 etiqueta = "Gasto" if tipo == "Gasto (Salida)" else "Pago"
-                guardar_registro(sh_obj, "Hoja 1", ["Manual", str(fecha), desc, monto, "-", "-", etiqueta, cta])
+                if guardar_registro(sh_obj, "Hoja 1", ["Manual", str(fecha), desc, monto, "-", "-", etiqueta, cta]):
+                    st.rerun()
 
-    # 2. Registrar Abono (NUEVO)
-    with st.expander("💳 Abonar / Cobrar Deuda"):
-        if df_deudas.empty:
-            st.warning("No hay deudas registradas.")
-        else:
-            # Filtramos solo las activas
+    with st.expander("💳 Abonar Deuda"):
+        if not df_deudas.empty:
             deudas_activas = df_deudas[df_deudas['ESTADO'] == 'Activo']['QUIEN'].tolist()
-            if not deudas_activas:
-                st.info("¡Estás libre de deudas!")
-            else:
-                with st.form("form_abono"):
-                    d_selec = st.selectbox("Selecciona la Deuda", deudas_activas)
-                    a_monto = st.number_input("Monto del Abono $", min_value=0.0)
-                    a_cta = st.selectbox("Cuenta de Origen/Destino", cuentas_lista)
-                    if st.form_submit_button("Registrar Abono"):
-                        if a_monto > 0:
-                            procesar_abono(sh_obj, d_selec, a_monto, a_cta)
+            with st.form("form_abono"):
+                d_selec = st.selectbox("Deuda", deudas_activas)
+                a_monto = st.number_input("Monto", min_value=0.0)
+                a_cta = st.selectbox("Cuenta", cuentas_lista)
+                if st.form_submit_button("Abonar"):
+                    procesar_abono(sh_obj, d_selec, a_monto, a_cta)
+                    st.rerun()
 
-    # 3. Nueva Deuda
     with st.expander("🤝 Nueva Deuda"):
         with st.form("form_deuda"):
             quien = st.text_input("Persona / Banco")
             d_tipo = st.selectbox("Tipo", ["Debo Yo", "Me Deben"])
-            d_monto = st.number_input("Monto Total $", min_value=0.0)
-            if st.form_submit_button("Crear Deuda"):
-                guardar_registro(sh_obj, "Deudas", [quien, d_tipo, d_monto, 0, str(hoy + timedelta(days=30)), "Activo"])
+            d_monto = st.number_input("Monto Total", min_value=0.0)
+            if st.form_submit_button("Crear"):
+                if guardar_registro(sh_obj, "Deudas", [quien, d_tipo, d_monto, 0, str(hoy + timedelta(days=30)), "Activo"]):
+                    st.rerun()
 
-    # 4. Inversión
     with st.expander("📈 Nueva Inversión"):
         with st.form("form_inv"):
             plat = st.selectbox("Plataforma", ["Nu", "Cetes", "GBM", "Banco"])
             prod = st.text_input("Producto")
-            m_inv = st.number_input("Inversión $", min_value=0.0)
+            m_inv = st.number_input("Monto", min_value=0.0)
             tasa = st.number_input("Tasa %", value=15.0)
-            if st.form_submit_button("Guardar Inversión"):
-                guardar_registro(sh_obj, "Inversiones", [plat, prod, str(hoy), m_inv, tasa, str(hoy + timedelta(days=365))])
-
+            if st.form_submit_button("Guardar"):
+                if guardar_registro(sh_obj, "Inversiones", [plat, prod, str(hoy), m_inv, tasa, str(hoy + timedelta(days=365))]):
+                    st.rerun()
+    
     if st.button("🔒 Salir"):
         st.session_state['password_correct'] = False
         st.rerun()
@@ -267,7 +318,6 @@ tab1, tab2, tab3, tab4 = st.tabs(["📊 Resumen", "📝 Detalle", "🚀 Inversio
 with tab1:
     st.subheader("Visión General")
     saldo_liquido = df_movs['IMPORTE_REAL'].sum() if not df_movs.empty else 0
-    
     valor_inv = 0
     if not df_inv.empty:
         for _, row in df_inv.iterrows():
@@ -275,11 +325,8 @@ with tab1:
             val = row['MONTO_INICIAL'] * ((1 + ((row['TASA_ANUAL']/100)/365)) ** max(dias, 0))
             valor_inv += val
             
-    # Sumar deudas pendientes (para restar al patrimonio real si quisiéramos ser estrictos, 
-    # pero usualmente patrimonio es activos - pasivos. Aquí mostramos activos brutos por simplicidad)
-    
     k1, k2, k3 = st.columns(3)
-    k1.metric("🏛️ Patrimonio (Activos)", f"${saldo_liquido + valor_inv:,.2f}")
+    k1.metric("🏛️ Patrimonio", f"${saldo_liquido + valor_inv:,.2f}")
     k2.metric("💵 Liquidez", f"${saldo_liquido:,.2f}")
     k3.metric("📈 Inversiones", f"${valor_inv:,.2f}")
     
@@ -299,7 +346,6 @@ with tab2:
         if not df_filtrado.empty:
             excel_data = descargar_excel(df_filtrado)
             st.download_button("📥 Excel", excel_data, "Reporte.xlsx")
-            
             st.divider()
             st.write("Generar Recibo")
             opcion = st.selectbox("Movimiento:", df_filtrado.index, format_func=lambda x: f"{df_filtrado.loc[x, 'DESCRIPCION']} (${df_filtrado.loc[x, 'IMPORTE']})")
@@ -343,4 +389,3 @@ with tab4:
                     st.progress(d['ABONADO']/d['MONTO_TOTAL'])
     else:
         st.info("Sin deudas.")
-
