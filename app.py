@@ -2,8 +2,10 @@ import streamlit as st
 import pandas as pd
 import gspread
 import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime, date, timedelta
 import calendar
+from fpdf import FPDF
 import base64
 from io import BytesIO
 import json
@@ -11,7 +13,7 @@ import time
 import requests
 
 # ================= CONFIGURACIÓN =================
-st.set_page_config(page_title="Asistente Financiero IA", page_icon="📅", layout="wide")
+st.set_page_config(page_title="Control Total V6", page_icon="💎", layout="wide")
 
 # ================= 🔒 LOGIN =================
 def check_password():
@@ -20,7 +22,7 @@ def check_password():
     
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
-        st.markdown("### 🔐 Acceso Seguro")
+        st.markdown("### 💎 Acceso Master")
         with st.form("login_form"):
             user = st.text_input("Usuario")
             pwd = st.text_input("Contraseña", type="password")
@@ -49,101 +51,129 @@ def conectar_google():
         st.error(f"Error conexión: {e}")
         st.stop()
 
-# ================= 🧠 MOTOR DE FECHAS INTELIGENTE =================
-def calcular_proxima_fecha(dia_objetivo):
-    """
-    Calcula la próxima fecha válida para un día específico (ej: día 30),
-    ajustándose si el mes actual no tiene ese día (ej: febrero).
-    """
+# ================= LÓGICA DE DATOS Y FECHAS =================
+def calcular_fecha_inteligente(dia_objetivo):
+    """Calcula la próxima ocurrencia de un día (ej: día 25) ajustando meses cortos"""
     if not dia_objetivo or dia_objetivo == 0: return None
-    
     hoy = datetime.now().date()
-    anio = hoy.year
-    mes = hoy.month
+    anio, mes = hoy.year, hoy.month
     
-    # Intentamos crear la fecha en el mes actual
     try:
-        # Función para obtener el último día válido del mes
-        _, ultimo_dia_mes = calendar.monthrange(anio, mes)
-        dia_ajustado = min(int(dia_objetivo), ultimo_dia_mes)
-        fecha_tentativa = date(anio, mes, dia_ajustado)
-    except:
-        fecha_tentativa = hoy # Fallback
+        _, ultimo = calendar.monthrange(anio, mes)
+        dia = min(int(dia_objetivo), ultimo)
+        fecha = date(anio, mes, dia)
+    except: return hoy
 
-    # Si la fecha ya pasó este mes, nos vamos al siguiente
-    if fecha_tentativa < hoy:
+    if fecha < hoy: # Si ya pasó, vamos al mes siguiente
         mes += 1
-        if mes > 12:
-            mes = 1
-            anio += 1
-        _, ultimo_dia_mes = calendar.monthrange(anio, mes)
-        dia_ajustado = min(int(dia_objetivo), ultimo_dia_mes)
-        fecha_tentativa = date(anio, mes, dia_ajustado)
-        
-    return fecha_tentativa
+        if mes > 12: mes=1; anio+=1
+        _, ultimo = calendar.monthrange(anio, mes)
+        dia = min(int(dia_objetivo), ultimo)
+        fecha = date(anio, mes, dia)
+    return fecha
 
-def cargar_datos_procesados(sh):
-    # 1. Movimientos
+@st.cache_data(ttl=5)
+def cargar_datos_master():
+    sh = conectar_google()
+    
+    # 1. Movimientos (Para calcular deuda real de tarjetas)
     try:
         df_movs = pd.DataFrame(sh.sheet1.get_all_records()).astype(str)
         if not df_movs.empty:
             df_movs['IMPORTE'] = pd.to_numeric(df_movs['IMPORTE'], errors='coerce').fillna(0).abs()
             df_movs['FECHA'] = pd.to_datetime(df_movs['FECHA'], errors='coerce', dayfirst=True)
+            # Signo Real
             df_movs['IMPORTE_REAL'] = df_movs.apply(lambda x: -x['IMPORTE'] if 'GASTO' in str(x['TIPO']).upper() else x['IMPORTE'], axis=1)
     except: df_movs = pd.DataFrame()
 
-    # 2. Deudas con Lógica Cíclica
+    # 2. Deudas y Configuración de Cuentas
+    calendario = []
     alertas = []
-    calendario_pagos = []
     
     try:
         df_deudas = pd.DataFrame(sh.worksheet("Deudas").get_all_records())
         if not df_deudas.empty:
-            df_deudas['MONTO_A_PAGAR'] = pd.to_numeric(df_deudas['MONTO_A_PAGAR'], errors='coerce').fillna(0)
-            
+            cols_num = ['MONTO_TOTAL', 'ABONADO', 'PLAZO_MESES']
+            for c in cols_num:
+                df_deudas[c] = pd.to_numeric(df_deudas[c], errors='coerce').fillna(0)
+
+            # PROCESAMIENTO INTELIGENTE
             for idx, row in df_deudas.iterrows():
                 if row['ESTADO'] != 'Activo': continue
                 
                 nombre = row['NOMBRE']
                 tipo = row['TIPO']
-                monto = row['MONTO_A_PAGAR']
+                dia_pago = int(row['DIA_PAGO']) if str(row['DIA_PAGO']).isdigit() else 0
                 
-                # A) LÓGICA CÍCLICA (Tarjetas)
-                if "Tarjeta" in tipo or (row.get('DIA_PAGO') and str(row['DIA_PAGO']).isdigit()):
-                    dia_corte = int(row['DIA_CORTE']) if str(row['DIA_CORTE']).isdigit() else None
-                    dia_pago = int(row['DIA_PAGO']) if str(row['DIA_PAGO']).isdigit() else None
+                # A) ES TARJETA DE CRÉDITO (Deuda Fluctuante)
+                if "Tarjeta" in tipo or "Crédito" in tipo:
+                    # Buscamos el saldo real en los movimientos
+                    saldo_real = 0
+                    if not df_movs.empty:
+                        # Sumamos todo lo gastado (negativo) y pagado (positivo) en esa cuenta
+                        movs_tarjeta = df_movs[df_movs['BANCO'] == nombre]
+                        saldo_real = movs_tarjeta['IMPORTE_REAL'].sum()
                     
-                    prox_corte = calcular_proxima_fecha(dia_corte)
-                    prox_pago = calcular_proxima_fecha(dia_pago)
+                    deuda_actual = abs(saldo_real) if saldo_real < 0 else 0
                     
-                    if prox_pago:
-                        dias_rest = (prox_pago - datetime.now().date()).days
-                        calendario_pagos.append({"Fecha": prox_pago, "Evento": f"Pago {nombre}", "Monto": monto, "Tipo": "Pago"})
-                        
-                        if 0 <= dias_rest <= 5:
-                            alertas.append(f"🔥 **{nombre}**: Pagar antes del {prox_pago.strftime('%d/%m')} (Faltan {dias_rest} días)")
-                    
-                    if prox_corte:
-                        calendario_pagos.append({"Fecha": prox_corte, "Evento": f"Corte {nombre}", "Monto": 0, "Tipo": "Corte"})
+                    # Generar evento de calendario
+                    prox_pago = calcular_fecha_inteligente(dia_pago)
+                    if prox_pago and deuda_actual > 0:
+                        dias = (prox_pago - datetime.now().date()).days
+                        calendario.append({"Fecha": prox_pago, "Evento": f"Pago {nombre}", "Monto": deuda_actual, "Tipo": "Tarjeta"})
+                        if 0 <= dias <= 5:
+                            alertas.append(f"💳 **{nombre}**: Pagar ${deuda_actual:,.2f} antes del {prox_pago.strftime('%d/%m')}")
 
-                # B) LÓGICA ÚNICA (Préstamos)
+                # B) ES PRÉSTAMO FIJO (Deuda Fija / Mensualidades)
                 else:
-                    try:
-                        fecha_venc = pd.to_datetime(row['FECHA_VENCIMIENTO']).date()
-                        dias_rest = (fecha_venc - datetime.now().date()).days
-                        calendario_pagos.append({"Fecha": fecha_venc, "Evento": f"Vence {nombre}", "Monto": monto, "Tipo": "Vencimiento"})
-                        
-                        if 0 <= dias_rest <= 5:
-                            alertas.append(f"⚠️ **{nombre}**: Vence el {fecha_venc.strftime('%d/%m')} (Faltan {dias_rest} días)")
-                        elif dias_rest < 0:
-                            alertas.append(f"☠️ **{nombre}**: VENCIDO hace {abs(dias_rest)} días")
-                    except: pass
+                    total = row['MONTO_TOTAL']
+                    abonado = row['ABONADO']
+                    meses = max(row['PLAZO_MESES'], 1)
                     
+                    # Cálculo de mensualidad sugerida
+                    mensualidad = total / meses
+                    restante = total - abonado
+                    pago_sugerido = min(mensualidad, restante)
+                    
+                    prox_pago = calcular_fecha_inteligente(dia_pago)
+                    if prox_pago and restante > 0:
+                        dias = (prox_pago - datetime.now().date()).days
+                        calendario.append({"Fecha": prox_pago, "Evento": f"Mensualidad {nombre}", "Monto": pago_sugerido, "Tipo": "Prestamo"})
+                        if 0 <= dias <= 5:
+                            alertas.append(f"🏦 **{nombre}**: Mensualidad de ${pago_sugerido:,.2f} vence el {prox_pago.strftime('%d/%m')}")
+                            
     except Exception as e:
-        st.error(f"Error procesando deudas: {e}")
         df_deudas = pd.DataFrame()
+        st.error(f"Error Deudas: {e}")
 
-    return df_movs, df_deudas, alertas, calendario_pagos, sh
+    # 3. Inversiones (Simple)
+    try:
+        df_inv = pd.DataFrame(sh.worksheet("Inversiones").get_all_records())
+        if not df_inv.empty:
+            df_inv['FECHA_INICIO'] = pd.to_datetime(df_inv['FECHA_INICIO'], errors='coerce', dayfirst=True)
+            df_inv['MONTO_INICIAL'] = pd.to_numeric(df_inv['MONTO_INICIAL']).fillna(0)
+    except: df_inv = pd.DataFrame()
+
+    return df_movs, df_deudas, df_inv, calendario, alertas, sh
+
+# ================= HERRAMIENTAS V3 (PDF/Excel) =================
+def generar_pdf(fecha, cuenta, monto, concepto):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, "COMPROBANTE", ln=1, align='C')
+    pdf.ln(10)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 10, f"Fecha: {fecha}", ln=1)
+    pdf.cell(0, 10, f"Monto: ${monto:,.2f}", ln=1)
+    pdf.cell(0, 10, f"Concepto: {concepto}", ln=1)
+    return pdf.output(dest='S').encode('latin-1')
+
+def descargar_excel(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False)
+    return output.getvalue()
 
 def guardar_registro(sh, hoja, datos):
     try:
@@ -152,90 +182,230 @@ def guardar_registro(sh, hoja, datos):
         return True
     except: return False
 
-# ================= INTERFAZ =================
-df_movs, df_deudas, alertas, calendario, sh_obj = cargar_datos_procesados(conectar_google())
+# ================= TELEGRAM (El Mayordomo) =================
+def procesar_telegram(sh):
+    TOKEN = st.secrets.get("telegram_token")
+    MY_ID = str(st.secrets.get("telegram_user_id")).strip()
+    if not TOKEN: return
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+        r = requests.get(url).json()
+        if not r.get('ok'): return
+        
+        for m in r['result']:
+            uid = m['update_id']
+            requests.get(f"{url}?offset={uid+1}") # Borrar cola
+            if str(m['message']['chat']['id']) != MY_ID: continue
+            
+            txt = m['message'].get('text','').lower().split()
+            if len(txt) >= 3:
+                # Lógica simple: gasto 50 concepto
+                try:
+                    monto = float(txt[1])
+                    desc = " ".join(txt[2:])
+                    hoy = datetime.now().strftime("%Y-%m-%d")
+                    tipo = "Gasto" if "gasto" in txt[0] else "Pago"
+                    guardar_registro(sh, "Hoja 1", ["Telegram", hoy, desc, monto, "-", "-", tipo, "Efectivo"])
+                    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id": MY_ID, "text": f"✅ {tipo} de ${monto} anotado."})
+                except: pass
+    except: pass
 
-# --- SIDEBAR ---
+# ================= INTERFAZ PRINCIPAL =================
+df_movs, df_deudas, df_inv, calendario, alertas, sh_obj = cargar_datos_master()
+
+# --- SIDEBAR: CENTRO DE MANDO ---
 with st.sidebar:
-    st.title("🎛️ Panel de Control")
-    st.caption("v5.0 - Motor Cíclico Activo")
+    st.title("🎛️ Centro de Mando")
     
-    # Nuevo Registro Inteligente
-    with st.expander("📝 Nuevo Compromiso"):
-        with st.form("nuevo_comp"):
-            c_nombre = st.text_input("Nombre (ej: Tarjeta Oro)")
-            c_tipo = st.selectbox("Tipo", ["Tarjeta Crédito (Cíclico)", "Préstamo Único"])
-            c_monto = st.number_input("Monto / Pago Mensual", min_value=0.0)
+    if st.button("🤖 Sincronizar Telegram"):
+        procesar_telegram(sh_obj)
+        st.rerun()
+    
+    st.divider()
+    
+    # 1. ACTUALIZAR CUENTAS EXISTENTES
+    with st.expander("⚙️ Configurar Cuenta/Tarjeta"):
+        st.info("Agrega fechas a tus cuentas existentes para activar el calendario.")
+        with st.form("config_cuenta"):
+            cuentas_existentes = sorted(list(df_movs['BANCO'].unique())) if not df_movs.empty else []
+            cta_sel = st.selectbox("Selecciona Cuenta", cuentas_existentes + ["Nueva..."])
+            c_tipo = st.selectbox("Tipo", ["Tarjeta Crédito (Fluctuante)", "Préstamo Fijo", "Débito/Efectivo"])
             
+            # Inputs condicionales visuales
+            st.caption("Configuración de Fechas:")
             col_a, col_b = st.columns(2)
-            if "Tarjeta" in c_tipo:
-                dia_corte = col_a.number_input("Día de Corte", 1, 31, 15)
-                dia_pago = col_b.number_input("Día Límite Pago", 1, 31, 5)
-                fecha_venc = ""
-            else:
-                dia_corte = ""
-                dia_pago = ""
-                fecha_venc = st.date_input("Fecha Vencimiento")
+            dia_corte = col_a.number_input("Día Corte", 0, 31, 0)
+            dia_pago = col_b.number_input("Día Pago", 0, 31, 0)
             
-            if st.form_submit_button("Guardar"):
-                # Guarda en formato compatible con la hoja
-                guardar_registro(sh_obj, "Deudas", [c_nombre, c_tipo, c_monto, dia_corte, dia_pago, str(fecha_venc), "Activo"])
-                st.toast("Guardado exitosamente")
+            if st.form_submit_button("Guardar Configuración"):
+                # Si es nueva o existente, la agregamos a DEUDAS como configuración
+                # NOMBRE, TIPO, TOTAL(0), PLAZO(1), CORTE, PAGO, ABONADO(0), ESTADO
+                guardar_registro(sh_obj, "Deudas", [cta_sel, c_tipo, 0, 1, dia_corte, dia_pago, 0, "Activo"])
+                st.toast("Cuenta configurada!")
                 time.sleep(1)
                 st.rerun()
 
-# --- ALERTAS INTELIGENTES ---
-st.subheader(f"Hola, {st.secrets.get('admin_user','Admin')}")
+    # 2. NUEVO PRÉSTAMO (DIVIDIR EN MESES)
+    with st.expander("🤝 Nuevo Préstamo / MSI"):
+        with st.form("nuevo_prestamo"):
+            p_nom = st.text_input("Nombre (ej: Préstamo Coche)")
+            p_total = st.number_input("Monto Total Deuda", min_value=0.0)
+            p_meses = st.number_input("Plazo (Meses)", min_value=1, value=12)
+            p_dia = st.number_input("Día de Pago Mensual", 1, 31, 5)
+            
+            mensualidad = p_total / p_meses if p_meses > 0 else 0
+            st.write(f"**Mensualidad estimada:** ${mensualidad:,.2f}")
+            
+            if st.form_submit_button("Registrar Deuda"):
+                guardar_registro(sh_obj, "Deudas", [p_nom, "Préstamo Fijo", p_total, p_meses, 0, p_dia, 0, "Activo"])
+                st.rerun()
 
+    # 3. GASTO RÁPIDO
+    with st.expander("💸 Gasto Rápido"):
+        with st.form("fast_gasto"):
+            g_monto = st.number_input("Monto", min_value=0.0, step=0.01, format="%.2f")
+            g_desc = st.text_input("Concepto")
+            g_cta = st.selectbox("Cuenta", cuentas_existentes if cuentas_existentes else ["Efectivo"])
+            if st.form_submit_button("Guardar"):
+                guardar_registro(sh_obj, "Hoja 1", ["Manual", str(datetime.now().date()), g_desc, g_monto, "-", "-", "Gasto", g_cta])
+                st.rerun()
+
+# --- ALERTAS VISIBLES ---
+st.subheader(f"Bienvenido, {st.secrets.get('admin_user','Jefe')}")
 if alertas:
-    for a in alertas:
-        if "🔥" in a: st.error(a)
-        elif "⚠️" in a: st.warning(a)
-        else: st.info(a)
-else:
-    st.success("✅ Todo tranquilo. No hay vencimientos urgentes en los próximos 5 días.")
+    for a in alertas: st.error(a)
 
-st.divider()
+# --- PESTAÑAS (RECUPERANDO TODO) ---
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard Visual", "📅 Calendario", "📝 Gestión Detallada", "💳 Deudas & Tarjetas"])
 
-# --- CALENDARIO VISUAL ---
-st.markdown("### 📅 Tu Calendario Financiero")
-
-if calendario:
-    df_cal = pd.DataFrame(calendario).sort_values("Fecha")
+# TAB 1: DASHBOARD VISUAL (Estilo V3)
+with tab1:
+    saldo = df_movs['IMPORTE_REAL'].sum() if not df_movs.empty else 0
+    inv = 0
+    if not df_inv.empty:
+        # Calculo simple de valor actual inv
+        inv = df_inv['MONTO_INICIAL'].sum() # Simplificado para velocidad
     
-    # Creamos columnas para simular un calendario lista
-    for i, row in df_cal.iterrows():
-        hoy = datetime.now().date()
-        delta = (row['Fecha'] - hoy).days
-        
-        # Estilos visuales según cercanía
-        if delta < 0: color = "gray"
-        elif delta == 0: color = "#FF4B4B" # Hoy
-        elif delta <= 7: color = "#FFA726" # Esta semana
-        else: color = "#66BB6A" # Futuro
-        
-        with st.container():
-            c1, c2, c3, c4 = st.columns([1, 4, 2, 2])
-            c1.markdown(f"**{row['Fecha'].strftime('%d %b')}**")
-            c2.write(f"{'🔴' if row['Tipo']=='Pago' else '✂️'} {row['Evento']}")
-            if row['Monto'] > 0:
+    col1, col2, col3 = st.columns(3)
+    col1.metric("💰 Liquidez Total", f"${saldo:,.2f}")
+    col2.metric("📈 En Inversiones", f"${inv:,.2f}")
+    
+    # GASTOS DEL MES
+    hoy = datetime.now()
+    if not df_movs.empty:
+        mask_mes = (df_movs['FECHA'].dt.month == hoy.month) & (df_movs['FECHA'].dt.year == hoy.year)
+        gastos_mes = abs(df_movs[mask_mes & (df_movs['IMPORTE_REAL'] < 0)]['IMPORTE_REAL'].sum())
+        col3.metric("💸 Gastos Este Mes", f"${gastos_mes:,.2f}")
+    
+    # GRÁFICOS
+    if not df_movs.empty:
+        c_g1, c_g2 = st.columns(2)
+        with c_g1:
+            gastos = df_movs[df_movs['IMPORTE_REAL'] < 0].copy()
+            gastos['Cat'] = gastos['DESCRIPCION'].str.split().str[0]
+            fig = px.pie(gastos, values='IMPORTE', names='Cat', title="Gastos por Concepto")
+            st.plotly_chart(fig, use_container_width=True)
+        with c_g2:
+            # Evolución saldo
+            df_evo = df_movs.sort_values('FECHA').copy()
+            df_evo['Saldo Acum'] = df_evo['IMPORTE_REAL'].cumsum()
+            fig2 = px.line(df_evo, x='FECHA', y='Saldo Acum', title="Evolución de tu Dinero")
+            st.plotly_chart(fig2, use_container_width=True)
+
+# TAB 2: CALENDARIO (Estilo V5)
+with tab2:
+    if calendario:
+        df_cal = pd.DataFrame(calendario).sort_values("Fecha")
+        for i, row in df_cal.iterrows():
+            dias = (row['Fecha'] - hoy.date()).days
+            color = "#ff4b4b" if dias <= 3 else "#ffa726" if dias <= 7 else "#2ecc71"
+            with st.container():
+                c1, c2, c3 = st.columns([1,3,2])
+                c1.write(f"**{row['Fecha'].strftime('%d %b')}**")
+                c2.markdown(f"<span style='color:{color}'>●</span> {row['Evento']}", unsafe_allow_html=True)
                 c3.write(f"**${row['Monto']:,.2f}**")
-            else:
-                c3.write("-")
-            
-            # Botón de acción rápida (simulado)
-            if delta >= 0:
-                c4.caption(f"En {delta} días")
-            else:
-                c4.caption("Pasado")
-            
-            st.markdown(f"<div style='height:2px; background-color:{color}; margin-bottom:10px;'></div>", unsafe_allow_html=True)
+                st.divider()
+    else:
+        st.info("Configura tus cuentas en el menú lateral para ver el calendario.")
 
-else:
-    st.info("No hay eventos próximos. Agrega deudas o tarjetas en el menú lateral.")
+# TAB 3: GESTIÓN DETALLADA (Estilo V4 - PDF/Excel)
+with tab3:
+    st.markdown("### 🛠️ Herramientas Administrativas")
+    
+    f_ini = st.date_input("Desde", date(hoy.year, 1, 1))
+    f_fin = st.date_input("Hasta", hoy)
+    
+    if not df_movs.empty:
+        mask = (df_movs['FECHA'].dt.date >= f_ini) & (df_movs['FECHA'].dt.date <= f_fin)
+        df_view = df_movs.loc[mask].sort_values('FECHA', ascending=False)
+        
+        c_tool1, c_tool2 = st.columns([3, 1])
+        with c_tool1:
+            st.dataframe(df_view[['FECHA', 'DESCRIPCION', 'IMPORTE_REAL', 'BANCO']], use_container_width=True)
+        
+        with c_tool2:
+            st.download_button("📥 Bajar Excel", descargar_excel(df_view), "Finanzas.xlsx")
+            st.write("---")
+            sel_pdf = st.selectbox("Imprimir Movimiento:", df_view.index, format_func=lambda x: f"{df_view.loc[x,'DESCRIPCION']}")
+            if st.button("🖨️ Generar PDF"):
+                r = df_view.loc[sel_pdf]
+                pdf_bytes = generar_pdf(str(r['FECHA'].date()), r['BANCO'], r['IMPORTE'], r['DESCRIPCION'])
+                b64 = base64.b64encode(pdf_bytes).decode()
+                st.markdown(f'<a href="data:application/pdf;base64,{b64}" download="Recibo.pdf">Descargar PDF</a>', unsafe_allow_html=True)
 
-# --- SECCIÓN DE GASTOS DIARIOS ---
-st.divider()
-st.markdown("### 💸 Movimientos Recientes")
-if not df_movs.empty:
-    st.dataframe(df_movs.sort_values('FECHA', ascending=False).head(5), use_container_width=True)
+# TAB 4: DEUDAS Y TARJETAS (Híbrido)
+with tab4:
+    st.subheader("💳 Estado de Deudas")
+    
+    if not df_deudas.empty:
+        for idx, row in df_deudas.iterrows():
+            if row['ESTADO'] == 'Activo':
+                with st.container():
+                    nombre = row['NOMBRE']
+                    tipo = row['TIPO']
+                    
+                    if "Tarjeta" in tipo:
+                        # Lógica Fluctuante: Calculamos deuda basada en gastos reales
+                        saldo_card = 0
+                        if not df_movs.empty:
+                            saldo_card = df_movs[df_movs['BANCO'] == nombre]['IMPORTE_REAL'].sum()
+                        
+                        deuda_real = abs(saldo_card) if saldo_card < 0 else 0
+                        st.markdown(f"### 💳 {nombre} (Crédito)")
+                        c1, c2 = st.columns(2)
+                        c1.metric("Deuda Actual (Fluctuante)", f"${deuda_real:,.2f}")
+                        if row.get('DIA_CORTE') and int(row['DIA_CORTE']) > 0:
+                             c2.caption(f"📅 Corte: Día {int(row['DIA_CORTE'])} | Pago: Día {int(row['DIA_PAGO'])}")
+                        
+                        # Barra inversa (Cuanto más debes, más se llena)
+                        st.progress(min(deuda_real / 10000, 1.0)) # Asumiendo linea de 10k visual
+                        st.divider()
+
+                    else:
+                        # Lógica Fija (Préstamos)
+                        total = row['MONTO_TOTAL']
+                        abonado = row['ABONADO']
+                        pendiente = total - abonado
+                        progreso = abonado / total if total > 0 else 0
+                        
+                        st.markdown(f"### 🏦 {nombre} (Préstamo)")
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Deuda Original", f"${total:,.2f}")
+                        c2.metric("Pagado", f"${abonado:,.2f}")
+                        c3.metric("Pendiente", f"${pendiente:,.2f}")
+                        
+                        st.progress(progreso)
+                        st.caption(f"Plazo: {int(row['PLAZO_MESES'])} meses")
+                        
+                        # Botón rápido de abono
+                        if st.button(f"Abonar Mensualidad (${total/max(row['PLAZO_MESES'],1):,.2f})", key=f"btn_{idx}"):
+                             # Actualizar hoja Deudas
+                             nuevo_abono = abonado + (total/max(row['PLAZO_MESES'],1))
+                             sh_obj.worksheet("Deudas").update_cell(idx+2, 7, nuevo_abono) # Col 7 es Abonado
+                             st.toast("Abono registrado!")
+                             time.sleep(1)
+                             st.rerun()
+                        st.divider()
+    else:
+        st.info("Configura tus cuentas en el menú lateral.")
+
