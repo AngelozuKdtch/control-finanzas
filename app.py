@@ -3,7 +3,7 @@ import pandas as pd
 import gspread
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, date
+from datetime import datetime, date, timedelta  # <--- AQUÍ FALTABA EL TIMEDELTA
 import calendar
 from fpdf import FPDF
 import base64
@@ -85,6 +85,9 @@ def cargar_datos_generales():
             # Convertir columnas numéricas
             cols_num = ['MONTO_INICIAL', 'TASA_ANUAL']
             for col in cols_num:
+                # Limpiamos símbolos de moneda o comas por si acaso
+                if df_inv[col].dtype == object:
+                    df_inv[col] = df_inv[col].str.replace('$', '').str.replace(',', '')
                 df_inv[col] = pd.to_numeric(df_inv[col], errors='coerce').fillna(0)
             
             # Fechas
@@ -100,6 +103,8 @@ def cargar_datos_generales():
 def calcular_rendimiento_actual(row):
     """Calcula cuánto vale HOY una inversión basada en interés compuesto diario"""
     hoy = datetime.now()
+    if pd.isnull(row['FECHA_INICIO']): return row['MONTO_INICIAL']
+    
     dias_transcurridos = (hoy - row['FECHA_INICIO']).days
     
     if dias_transcurridos < 0: return row['MONTO_INICIAL'] # Fecha futura
@@ -124,7 +129,10 @@ def guardar_inversion_nueva(sh, plataforma, producto, fecha_ini, monto, tasa, fe
 
 # ================= INTERFAZ =================
 st.title("📈 Portafolio de Inversiones & Gastos")
-st.caption(f"Bienvenido, {st.secrets['admin_user']}")
+
+# Saludo seguro (evita error si el usuario no ha entrado aún)
+usuario = st.secrets["admin_user"] if "admin_user" in st.secrets else "Usuario"
+st.caption(f"Bienvenido, {usuario}")
 
 df_movs, df_inv, sh_obj = cargar_datos_generales()
 
@@ -138,6 +146,7 @@ with st.sidebar.expander("💰 Nueva Inversión", expanded=False):
         i_monto = st.number_input("Monto Inicial ($)", min_value=0.0)
         i_tasa = st.number_input("Tasa Anual (%)", min_value=0.0, value=15.0)
         i_fecha = st.date_input("Fecha Inicio", datetime.now())
+        # AQUI ESTABA EL ERROR: Ahora timedelta ya existe
         i_meta = st.date_input("Fecha Meta (Fin)", datetime.now() + timedelta(days=365))
         
         if st.form_submit_button("Registrar Inversión"):
@@ -213,16 +222,25 @@ with tab_inv:
                 # Barra de Progreso Temporal
                 with cols[1]:
                     hoy = datetime.now()
-                    inicio = row['FECHA_INICIO']
-                    fin = row['FECHA_FIN'] if pd.notnull(row['FECHA_FIN']) else inicio + timedelta(days=365)
-                    
-                    total_dias = (fin - inicio).days
-                    dias_pasados = (hoy - inicio).days
-                    progreso = min(max(dias_pasados / total_dias, 0.0), 1.0) if total_dias > 0 else 0
-                    
-                    st.write(f"**Progreso de Meta:** {progreso*100:.1f}% ({dias_pasados}/{total_dias} días)")
-                    st.progress(progreso)
-                    st.caption(f"Inicia: {inicio.date()} ➝ Termina: {fin.date()}")
+                    try:
+                        inicio = row['FECHA_INICIO']
+                        fin = row['FECHA_FIN'] if pd.notnull(row['FECHA_FIN']) else inicio + timedelta(days=365)
+                        
+                        if pd.isnull(inicio): inicio = hoy # Fallback
+                        
+                        total_dias = (fin - inicio).days
+                        dias_pasados = (hoy - inicio).days
+                        
+                        if total_dias > 0:
+                            progreso = min(max(dias_pasados / total_dias, 0.0), 1.0)
+                        else:
+                            progreso = 0
+                        
+                        st.write(f"**Progreso de Meta:** {progreso*100:.1f}% ({dias_pasados}/{total_dias} días)")
+                        st.progress(progreso)
+                        st.caption(f"Inicia: {inicio.date()} ➝ Termina: {fin.date()}")
+                    except:
+                        st.warning("Revisa las fechas en Excel")
 
                 # Datos Financieros
                 with cols[2]:
@@ -234,7 +252,7 @@ with tab_inv:
         st.expander("Ver tabla de detalles").dataframe(df_inv[['PLATAFORMA','MONTO_INICIAL','TASA_ANUAL','VALOR_ACTUAL','GANANCIA']])
 
 with tab_gastos:
-    st.info("Aquí sigue estando tu control de gastos normal (cargando datos de la hoja principal...)")
+    st.info("Aquí sigue estando tu control de gastos normal.")
     # Reutilizamos lógica simple de visualización
     if not df_movs.empty:
         # Filtros básicos
@@ -242,3 +260,4 @@ with tab_gastos:
         gastos_mes = abs(last_month[last_month['IMPORTE_REAL'] < 0]['IMPORTE_REAL'].sum())
         st.metric("Gastos últimos 30 días", f"${gastos_mes:,.2f}")
         st.dataframe(last_month.tail(10))
+
