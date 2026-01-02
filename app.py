@@ -15,7 +15,7 @@ import requests
 from dateutil.relativedelta import relativedelta
 
 # ================= CONFIGURACIÓN =================
-st.set_page_config(page_title="Control Total V8 - Master", page_icon="💎", layout="wide")
+st.set_page_config(page_title="Control Total V9 - Titanium", page_icon="💎", layout="wide")
 
 # ================= 🔒 LOGIN =================
 def check_password():
@@ -217,6 +217,7 @@ def cargar_datos_master():
                 if col not in df_movs.columns: df_movs[col] = 0
             
             # GASTO es negativo, INGRESO es positivo
+            # NOTA: 'Devolucion' cuenta como positivo (reduce deuda o suma dinero)
             df_movs['IMPORTE_REAL'] = df_movs.apply(
                 lambda x: -x['IMPORTE'] if 'GASTO' in str(x['TIPO']).upper() else x['IMPORTE'], axis=1
             )
@@ -228,7 +229,7 @@ def cargar_datos_master():
     try:
         df_deudas = pd.DataFrame(sh.worksheet("Deudas").get_all_records())
         if not df_deudas.empty:
-            for c in ['MONTO_TOTAL', 'ABONADO', 'PLAZO_MESES', 'DIA_CORTE', 'DIA_PAGO', 'INTERES_ORIGINAL']:
+            for c in ['MONTO_TOTAL', 'ABONADO', 'PLAZO_MESES', 'DIA_CORTE', 'DIA_PAGO', 'INTERES_ORIGINAL', 'LIMITE_CREDITO']:
                 if c in df_deudas.columns: df_deudas[c] = pd.to_numeric(df_deudas[c], errors='coerce').fillna(0)
             
             # Generar alertas visuales
@@ -317,17 +318,24 @@ with st.sidebar:
     
     st.divider()
     
-    # 1. CONFIGURAR CUENTAS
-    with st.expander("⚙️ Configurar Cuenta"):
+    # 1. CONFIGURAR CUENTAS (AGREGADO: LIMITE DE CRÉDITO)
+    with st.expander("⚙️ Configurar Cuenta/Tarjeta"):
         with st.form("conf_cuenta"):
             cuentas = sorted(list(df_movs['BANCO'].unique())) if not df_movs.empty else []
             cta = st.selectbox("Cuenta", cuentas + ["Nueva..."])
             tipo = st.selectbox("Tipo", ["Tarjeta Crédito", "Préstamo", "Débito/Efectivo"])
+            
             c1, c2 = st.columns(2)
             d_corte = c1.number_input("Día Corte", 0, 31, 0)
             d_pago = c2.number_input("Día Pago", 0, 31, 0)
+            
+            # Nuevo: Límite de Crédito
+            limite = st.number_input("Límite de Crédito (Opcional)", min_value=0.0)
+            
             if st.form_submit_button("Guardar"):
-                guardar_registro(sh_obj, "Deudas", [cta, tipo, 0, 1, d_corte, d_pago, 0, "Activo"])
+                # Se guarda en Deudas. OJO: El orden importa si usas índices fijos.
+                # ESTRUCTURA SUGERIDA: Nombre, Tipo, Total, Plazo, Corte, Pago, Abonado, Estado, Interes, Limite
+                guardar_registro(sh_obj, "Deudas", [cta, tipo, 0, 1, d_corte, d_pago, 0, "Activo", 0, limite])
                 st.rerun()
 
     # 2. DEUDAS (YO DEBO / ME DEBEN)
@@ -350,19 +358,24 @@ with st.sidebar:
                 guardar_registro(sh_obj, "Deudas", [nom, tipo_int, total, meses, 0, dia, 0, "Activo", interes])
                 st.rerun()
 
-    # 3. REGISTRAR MOVIMIENTOS (GASTOS, INGRESOS, PAGOS)
+    # 3. REGISTRAR MOVIMIENTOS (GASTOS, INGRESOS, PAGOS, DEVOLUCIONES)
     with st.expander("📝 Registrar Movimiento"):
-        # Esto soluciona tu duda de dónde poner el dinero que tienes
-        tipo_mov = st.selectbox("Tipo de Movimiento", ["Gasto / Pago (-)", "Ingreso / Saldo Inicial (+)"])
+        # Se agregaron tipos para Devolución
+        tipo_mov = st.selectbox("Tipo", [
+            "Gasto (-)", 
+            "Pago a Tarjeta/Deuda (-)", 
+            "Ingreso / Saldo (+)", 
+            "Devolución / Reembolso (+)"
+        ])
         
         monto = st.number_input("Monto", 0.0, step=10.0)
-        desc = st.text_input("Concepto (ej. Nomina, Super)")
+        desc = st.text_input("Concepto")
         cuenta = st.selectbox("Cuenta Afectada", cuentas if cuentas else ["Efectivo"])
         
-        # Opciones Avanzadas (Meses)
         es_msi = False
         plazo, int_extra = 1, 0.0
         
+        # Solo mostrar MSI si es Gasto
         if "Gasto" in tipo_mov:
             es_msi = st.checkbox("¿A Meses / Diferido?")
             if es_msi:
@@ -380,9 +393,13 @@ with st.sidebar:
                     corte_auto = int(row.get('DIA_CORTE', 0))
                 except: pass
             
-            tipo_final = "Gasto" if "Gasto" in tipo_mov else "Ingreso"
+            # Definir TIPO interno para la base de datos
+            if "Gasto" in tipo_mov: tipo_final = "Gasto"
+            elif "Pago" in tipo_mov: tipo_final = "Pago"
+            elif "Ingreso" in tipo_mov: tipo_final = "Ingreso"
+            else: tipo_final = "Devolucion" # Para que lo detecte como positivo
+            
             fecha = str(datetime.now().date())
-            # Guardamos
             guardar_registro(sh_obj, "Hoja 1", ["Manual", fecha, desc, monto, "-", "-", tipo_final, cuenta, plazo, int_extra, corte_auto])
             st.success("Registrado.")
             time.sleep(1)
@@ -443,149 +460,120 @@ with tab2:
 with tab3:
     if not df_movs.empty:
         v = df_movs.sort_values('FECHA', ascending=False).head(100)
-        st.dataframe(v[['FECHA','DESCRIPCION','IMPORTE_REAL','BANCO','TIPO']], use_container_width=True)
+        # Mostrar Tipo para ver si es Devolución
+        st.dataframe(v[['FECHA','DESCRIPCION','IMPORTE_REAL','TIPO','BANCO']], use_container_width=True)
         st.download_button("📥 Excel", descargar_excel(v), "data.xlsx")
         
-        # PDF Generator
         sel = st.selectbox("Generar Recibo de:", v.index, format_func=lambda x: f"{v.loc[x,'DESCRIPCION']} (${v.loc[x,'IMPORTE']})")
         if st.button("🖨️ PDF"):
             r = v.loc[sel]
             b64 = base64.b64encode(generar_pdf(str(r['FECHA']), r['BANCO'], r['IMPORTE'], r['DESCRIPCION'])).decode()
             st.markdown(f'<a href="data:application/pdf;base64,{b64}" download="recibo.pdf">Descargar PDF</a>', unsafe_allow_html=True)
 
-# TAB 4: DEUDAS Y COBROS (FLEXIBLE)
+# TAB 4: DEUDAS Y COBROS (TITANIUM EDITION)
 with tab4:
-    # --- A. CUENTAS POR COBRAR (ME DEBEN) ---
+    # A. ME DEBEN
     st.subheader("🟢 Cuentas por Cobrar (Activos)")
     if not df_deudas.empty:
-        # Filtro: Lo que es 'Por Cobrar' y está Activo
         cobros = df_deudas[(df_deudas['TIPO'] == 'Por Cobrar') & (df_deudas['ESTADO'] == 'Activo')]
-        
         if not cobros.empty:
             for i, row in cobros.iterrows():
-                nombre = row['NOMBRE']
-                total = row.get('MONTO_TOTAL', 0)
-                abonado = row.get('ABONADO', 0)
-                pendiente = total - abonado
+                tot, abo = row.get('MONTO_TOTAL',0), row.get('ABONADO',0)
+                pend = tot - abo
                 
-                # Calculamos la cuota sugerida (mensualidad)
-                plazo = max(int(row.get('PLAZO_MESES', 1)), 1)
-                sugerido = pendiente / max((plazo - (abonado / (total/plazo) if total > 0 else 0)), 1)
-                if sugerido > pendiente: sugerido = pendiente
-                
+                # Sugerencia de cobro
+                plazo = max(int(row.get('PLAZO_MESES',1)), 1)
+                sugerido = pend / max((plazo - (abo/(tot/plazo) if tot>0 else 0)), 1)
+
                 with st.container():
-                    col_info, col_action = st.columns([2, 1])
+                    c1, c2 = st.columns([2,1])
+                    c1.metric(row['NOMBRE'], f"Te deben: ${pend:,.2f}")
+                    c1.progress(min(abo/tot, 1.0) if tot>0 else 0)
                     
-                    with col_info:
-                        st.markdown(f"**👤 {nombre}**")
-                        st.progress(min(abonado/total, 1.0) if total > 0 else 0)
-                        k1, k2 = st.columns(2)
-                        k1.caption(f"Debe Total: ${total:,.2f}")
-                        k2.metric("Pendiente", f"${pendiente:,.2f}")
-
-                    with col_action:
-                        # CAJA FLEXIBLE: El usuario decide cuánto le pagaron
-                        monto_recibido = st.number_input("Monto Recibido", min_value=0.0, max_value=float(pendiente), value=float(sugerido), key=f"rec_{i}")
-                        
-                        if st.button("✅ Registrar Cobro", key=f"btn_c_{i}"):
-                            if monto_recibido > 0:
-                                try:
-                                    # 1. Actualizar Deuda en Sheet
-                                    cell = sh_obj.worksheet("Deudas").find(nombre)
-                                    sh_obj.worksheet("Deudas").update_cell(cell.row, 7, abonado + monto_recibido)
-                                    
-                                    # 2. Registrar el Ingreso en Flujo (Hoja 1) para que suba tu saldo
-                                    hoy_str = str(datetime.now().date())
-                                    sh_obj.worksheet("Hoja 1").append_row(
-                                        ["Auto", hoy_str, f"Cobro a {nombre}", monto_recibido, "-", "-", "Ingreso", "Efectivo", 1, 0, 0]
-                                    )
-                                    
-                                    st.toast(f"¡Genial! Cobraste ${monto_recibido:,.2f}")
-                                    time.sleep(1)
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Error: {e}")
+                    monto_rec = c2.number_input("Recibido", 0.0, float(pend), float(min(sugerido, pend)), key=f"rec_{i}")
+                    if c2.button("✅ Registrar Cobro", key=f"c_{i}"):
+                        cell = sh_obj.worksheet("Deudas").find(row['NOMBRE'])
+                        sh_obj.worksheet("Deudas").update_cell(cell.row, 7, abo + monto_rec)
+                        # Registrar entrada
+                        hoy_s = str(datetime.now().date())
+                        sh_obj.worksheet("Hoja 1").append_row(["Auto", hoy_s, f"Cobro {row['NOMBRE']}", monto_rec, "-", "-", "Ingreso", "Efectivo", 1, 0, 0])
+                        st.rerun()
                     st.divider()
-        else:
-            st.info("Nadie te debe dinero actualmente.")
+        else: st.info("Nadie te debe dinero.")
 
-    # --- B. MIS DEUDAS (YO DEBO) ---
+    # B. YO DEBO (PASIVOS AVANZADOS)
     st.subheader("🔴 Mis Deudas (Pasivos)")
     if not df_deudas.empty:
         deudas = df_deudas[(df_deudas['TIPO'] != 'Por Cobrar') & (df_deudas['ESTADO'] == 'Activo')]
-        
         for i, row in deudas.iterrows():
-            nombre = row['NOMBRE']
-            
+            nom = row['NOMBRE']
             with st.container():
-                # Encabezado
-                tipo_icono = "💳" if "Tarjeta" in row['TIPO'] else "🏦"
-                st.markdown(f"#### {tipo_icono} {nombre}")
-
-                # Lógica Tarjeta vs Préstamo
+                st.markdown(f"#### {nom}")
+                
+                # Cálculo de Deuda
                 es_tarjeta = "Tarjeta" in row['TIPO']
-                saldo_pendiente = 0
-                
                 if es_tarjeta:
-                    # Para tarjeta, la deuda es la suma de gastos en el historial
-                    saldo_real = 0
-                    if not df_movs.empty:
-                        saldo_real = df_movs[df_movs['BANCO'] == nombre]['IMPORTE_REAL'].sum()
-                    saldo_pendiente = abs(saldo_real) if saldo_real < 0 else 0
-                    st.caption(f"Corte: Día {int(row.get('DIA_CORTE',0))} | Pagar antes del: Día {int(row.get('DIA_PAGO',0))}")
+                    sal = 0
+                    if not df_movs.empty: sal = df_movs[df_movs['BANCO']==nom]['IMPORTE_REAL'].sum()
+                    deuda = abs(sal) if sal < 0 else 0
+                    
+                    # CÁLCULO DE LÍMITE
+                    limite = float(row.get('LIMITE_CREDITO', 0))
+                    disponible = limite - deuda
+                    disp_txt = f"${disponible:,.2f}" if limite > 0 else "No definido"
+                    
+                    col_metrics = st.columns(3)
+                    col_metrics[0].metric("Deuda Total", f"${deuda:,.2f}")
+                    col_metrics[1].metric("Límite", f"${limite:,.2f}" if limite > 0 else "-")
+                    col_metrics[2].metric("Disponible", disp_txt)
                 else:
-                    # Para préstamo, es Total - Abonado
-                    total = row.get('MONTO_TOTAL', 0)
-                    abonado = row.get('ABONADO', 0)
-                    saldo_pendiente = total - abonado
+                    tot, abo = row.get('MONTO_TOTAL',0), row.get('ABONADO',0)
+                    deuda = tot - abo
+                    st.metric("Pendiente Préstamo", f"${deuda:,.2f}")
                 
-                # Columnas de Acción
-                c_izq, c_der = st.columns([1, 1])
-                
-                with c_izq:
-                    st.metric("Deuda Actual", f"${saldo_pendiente:,.2f}")
-                    if saldo_pendiente > 0:
-                        # Barra de progreso inversa (mientras más pagas, menos roja)
-                        if not es_tarjeta and total > 0:
-                            st.progress(min(abonado/total, 1.0))
-                
-                with c_der:
-                    # --- AQUÍ ESTÁ LA SOLUCIÓN A TU DUDA ---
-                    # Calculamos un sugerido, pero TÚ lo puedes cambiar
-                    if es_tarjeta:
-                        sugerido = saldo_pendiente # En tarjeta sueles querer pagar todo para no generar intereses
-                    else:
-                        # En préstamos, sugerimos la mensualidad
-                        plazo = max(int(row.get('PLAZO_MESES', 1)), 1)
-                        sugerido = row.get('MONTO_TOTAL', 0) / plazo
-                    
-                    # Input Manual: Aquí pones 20, 50, o todo lo que quieras
-                    pago_manual = st.number_input("Monto a Pagar", min_value=0.0, value=float(min(sugerido, saldo_pendiente)), key=f"pay_in_{i}")
-                    
-                    if st.button("💸 Realizar Pago", key=f"pay_btn_{i}"):
-                        if pago_manual > 0:
-                            try:
-                                # 1. Registrar el Gasto en Historial (Resta dinero de tu liquidez)
-                                hoy_str = str(datetime.now().date())
-                                # Si es tarjeta, es un 'Pago' a la cuenta. Si es préstamo, es gasto.
-                                concepto_pago = f"Pago Tarjeta {nombre}" if es_tarjeta else f"Abono {nombre}"
-                                sh_obj.worksheet("Hoja 1").append_row(
-                                    ["Auto", hoy_str, concepto_pago, pago_manual, "-", "-", "Pago", nombre if es_tarjeta else "Efectivo", 1, 0, 0]
-                                )
-                                
-                                # 2. Si es PRÉSTAMO, actualizamos el 'Abonado' en la hoja Deudas
-                                # (Las tarjetas se actualizan solas al registrar el gasto en Hoja 1)
-                                if not es_tarjeta:
-                                    cell = sh_obj.worksheet("Deudas").find(nombre)
-                                    nuevo_abonado = row.get('ABONADO', 0) + pago_manual
-                                    sh_obj.worksheet("Deudas").update_cell(cell.row, 7, nuevo_abonado)
+                # --- ACCIONES ---
+                # 1. PAGO NORMAL
+                with st.expander("💸 Realizar Pago / Abono"):
+                    a_pagar = st.number_input("Monto", 0.0, float(deuda), float(deuda) if es_tarjeta else float(deuda/max(int(row.get('PLAZO_MESES',1)),1)), key=f"p_in_{i}")
+                    if st.button("Pagar", key=f"p_btn_{i}"):
+                        hoy_s = str(datetime.now().date())
+                        # Registrar en historial
+                        sh_obj.worksheet("Hoja 1").append_row(["Auto", hoy_s, f"Pago {nom}", a_pagar, "-", "-", "Pago", nom if es_tarjeta else "Efectivo", 1, 0, 0])
+                        # Si es prestamo, actualizar abono
+                        if not es_tarjeta:
+                            cell = sh_obj.worksheet("Deudas").find(nom)
+                            sh_obj.worksheet("Deudas").update_cell(cell.row, 7, row.get('ABONADO',0) + a_pagar)
+                        st.success("Pago registrado."); time.sleep(1); st.rerun()
 
-                                st.success(f"Pago de ${pago_manual:,.2f} registrado.")
-                                time.sleep(1)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error: {e}")
+                # 2. INCUMPLIMIENTO (BOTÓN DE PÁNICO)
+                with st.expander("⚠️ Registrar Incumplimiento / Intereses"):
+                    st.warning("Esto aumentará tu deuda por intereses moratorios o penalizaciones.")
+                    col_pen1, col_pen2 = st.columns(2)
+                    penalizacion_fija = col_pen1.number_input("Comisión Fija (Multa)", 0.0, step=100.0, key=f"pen_{i}")
+                    interes_moratorio = col_pen2.number_input("Interés Moratorio %", 0.0, step=1.0, key=f"int_mor_{i}")
+                    
+                    nuevo_saldo_simulado = (deuda * (1 + interes_moratorio/100)) + penalizacion_fija
+                    st.write(f"Nueva deuda estimada: ${nuevo_saldo_simulado:,.2f}")
+                    
+                    if st.button("Aplicar Penalización", key=f"btn_pen_{i}"):
+                        # Lógica: Aumentar el MONTO_TOTAL de la deuda en Sheets
+                        # Si es tarjeta, es difícil porque se calcula por movimientos.
+                        # SOLUCIÓN: Generar un GASTO negativo (que aumente deuda) llamado "Intereses/Multa"
+                        hoy_s = str(datetime.now().date())
+                        monto_ajuste = nuevo_saldo_simulado - deuda
+                        
+                        sh_obj.worksheet("Hoja 1").append_row(
+                            ["Auto", hoy_s, f"Penalización/Interes {nom}", monto_ajuste, "-", "-", "Gasto", nom if es_tarjeta else "Efectivo", 1, 0, 0]
+                        )
+                        
+                        # Si es préstamo fijo, también debemos subir el total en Deudas
+                        if not es_tarjeta:
+                            cell = sh_obj.worksheet("Deudas").find(nom)
+                            # Columna 3 es MONTO_TOTAL (Verificar indice)
+                            # Se asume estructura [NOMBRE, TIPO, TOTAL, ABONADO...] -> Total es col 3
+                            total_actual = row.get('MONTO_TOTAL',0)
+                            sh_obj.worksheet("Deudas").update_cell(cell.row, 3, total_actual + monto_ajuste)
+                            
+                        st.error("Deuda aumentada por penalización."); time.sleep(1); st.rerun()
                 
                 st.divider()
-    else:
-        st.info("No tienes deudas activas registradas.")
