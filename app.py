@@ -363,46 +363,51 @@ with st.sidebar:
                 guardar_registro(sh_obj, "Deudas", [p_nom, "Préstamo Fijo", deuda_total, p_meses, 0, p_dia, 0, "Activo", p_interes])
                 st.rerun()
 
-    # 3. GASTO RÁPIDO (Con MSI y Detección de Corte)
+   # 3. GASTO RÁPIDO (INTERACTIVO - SIN FORMULARIO BLOQUEANTE)
     with st.expander("💸 Gasto Rápido / Tarjetazo"):
-        with st.form("fast_gasto"):
-            g_monto = st.number_input("Monto", min_value=0.0, step=0.01)
-            g_desc = st.text_input("Concepto")
-            g_cta = st.selectbox("Cuenta", cuentas_existentes if cuentas_existentes else ["Efectivo"])
+        # Quitamos 'with st.form' para que reaccione al instante
+        g_monto = st.number_input("Monto", min_value=0.0, step=0.01)
+        g_desc = st.text_input("Concepto")
+        g_cta = st.selectbox("Cuenta", cuentas_existentes if cuentas_existentes else ["Efectivo"])
+        
+        # Checkbox interactivo
+        es_a_meses = st.checkbox("¿A Meses / Diferido?")
+        
+        # Variables por defecto
+        g_plazo = 1
+        g_interes = 0.0
+        
+        # Si activa la casilla, mostramos los campos AL INSTANTE
+        if es_a_meses:
+            c_m1, c_m2 = st.columns(2)
+            g_plazo = c_m1.number_input("Meses", min_value=2, max_value=48, value=3)
+            g_interes = c_m2.number_input("Interés Extra (%)", 0.0, 100.0, 0.0)
             
-            # Opción para diferir pagos
-            es_a_meses = st.checkbox("¿A Meses / Diferido?")
-            if es_a_meses:
-                c_m1, c_m2 = st.columns(2)
-                g_plazo = c_m1.number_input("Meses", 2, 48, 3)
-                g_interes = c_m2.number_input("Interés Extra (%)", 0.0, 100.0, 0.0)
-            else:
-                g_plazo = 1
-                g_interes = 0.0
-                
-            if st.form_submit_button("Guardar"):
-                # A. Detectar Día de Corte de la tarjeta seleccionada
-                dia_corte_auto = 0
-                try:
-                    if not df_deudas.empty:
-                        # Filtramos la tarjeta
-                        row_cta = df_deudas[df_deudas['NOMBRE'] == g_cta]
-                        if not row_cta.empty:
-                             # Intentamos leer la columna DIA_CORTE (o por indice 4 si los nombres fallan)
-                             val = row_cta.iloc[0]['DIA_CORTE'] if 'DIA_CORTE' in row_cta.columns else row_cta.iloc[0, 4]
-                             dia_corte_auto = int(val)
-                except: pass
-                
-                # B. Guardar (Agregando Plazo, Interés y Corte al final)
-                # Hoja 1: Manual, Fecha, Desc, Importe, -, -, Gasto, Banco, PLAZO, INTERES, DIA_CORTE
-                fecha_hoy = str(datetime.now().date())
-                datos = ["Manual", fecha_hoy, g_desc, g_monto, "-", "-", "Gasto", g_cta, g_plazo, g_interes, dia_corte_auto]
-                
-                guardar_registro(sh_obj, "Hoja 1", datos)
-                st.success("✅ Gasto registrado.")
-                time.sleep(1)
-                st.rerun()
-
+            # Calculadora visual pequeña
+            total_final = g_monto * (1 + (g_interes/100))
+            pago_mensual = total_final / g_plazo
+            st.caption(f"Pagarás: ${total_final:,.2f} ({g_plazo} pagos de ${pago_mensual:,.2f})")
+            
+        if st.button("Guardar Gasto"):
+            # A. Detectar Día de Corte Automáticamente
+            dia_corte_auto = 0
+            try:
+                if not df_deudas.empty:
+                    row_cta = df_deudas[df_deudas['NOMBRE'] == g_cta]
+                    if not row_cta.empty:
+                         # Intentamos leer columna DIA_CORTE o índice 4
+                         val = row_cta.iloc[0]['DIA_CORTE'] if 'DIA_CORTE' in row_cta.columns else row_cta.iloc[0, 4]
+                         dia_corte_auto = int(val)
+            except: pass
+            
+            # B. Guardar
+            fecha_hoy = str(datetime.now().date())
+            datos = ["Manual", fecha_hoy, g_desc, g_monto, "-", "-", "Gasto", g_cta, g_plazo, g_interes, dia_corte_auto]
+            
+            guardar_registro(sh_obj, "Hoja 1", datos)
+            st.success("✅ Gasto registrado correctamente.")
+            time.sleep(1)
+            st.rerun()
 # --- MOSTRAR ALERTAS ---
 st.subheader(f"Bienvenido, {st.secrets.get('admin_user','Admin')}")
 if alertas:
@@ -577,3 +582,4 @@ with tab4:
                     st.divider()
     else:
         st.info("No hay deudas activas. Agrega una en el menú lateral.")
+
