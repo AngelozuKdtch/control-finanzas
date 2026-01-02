@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import gspread
 import plotly.express as px
 import plotly.graph_objects as go
@@ -11,6 +12,7 @@ from io import BytesIO
 import json
 import time
 import requests
+from dateutil.relativedelta import relativedelta
 
 # ================= CONFIGURACIÓN =================
 st.set_page_config(page_title="Control Total V6", page_icon="💎", layout="wide")
@@ -71,6 +73,53 @@ def calcular_fecha_inteligente(dia_objetivo):
         dia = min(int(dia_objetivo), ultimo)
         fecha = date(anio, mes, dia)
     return fecha
+
+# ================= NUEVA LÓGICA: MOTOR DE PROYECCIÓN =================
+def generar_flujo_real(df_bruto):
+    """Convierte compras a MSI en flujo mensual real"""
+    pagos_proyectados = []
+    
+    # Aseguramos que existan las columnas para no romper el código si faltan
+    cols_req = ['PLAZO_MESES', 'INTERES', 'DIA_CORTE']
+    for c in cols_req:
+        if c not in df_bruto.columns: df_bruto[c] = 0
+
+    for index, row in df_bruto.iterrows():
+        try:
+            # Si no hay fecha válida, saltamos
+            if pd.isna(pd.to_datetime(row['FECHA'], errors='coerce')): continue
+
+            fecha_compra = pd.to_datetime(row['FECHA'], dayfirst=True)
+            monto_original = abs(float(str(row['IMPORTE']).replace(',','')))
+            
+            # Datos de configuración (con valores por defecto seguros)
+            plazo = int(row['PLAZO_MESES']) if str(row['PLAZO_MESES']).isdigit() and int(row['PLAZO_MESES']) > 0 else 1
+            interes_pct = float(row['INTERES']) if str(row['INTERES']).replace('.','',1).isdigit() else 0.0
+            dia_corte = int(row['DIA_CORTE']) if str(row['DIA_CORTE']).isdigit() else 0
+            
+            # Cálculo
+            monto_total = monto_original * (1 + (interes_pct / 100))
+            pago_mensual = monto_total / plazo
+            
+            # Ajuste de Fecha de Inicio (Corte de Tarjeta)
+            fecha_inicio = fecha_compra
+            if dia_corte > 0 and fecha_compra.day > dia_corte:
+                fecha_inicio = fecha_compra + relativedelta(months=1)
+
+            # Generar Cuotas
+            for i in range(plazo):
+                fecha_pago = fecha_inicio + relativedelta(months=i)
+                pagos_proyectados.append({
+                    'FECHA': fecha_pago,
+                    'DESCRIPCION': f"{row['DESCRIPCION']} ({i+1}/{plazo})" if plazo > 1 else row['DESCRIPCION'],
+                    'IMPORTE': pago_mensual,
+                    'IMPORTE_REAL': -pago_mensual if 'Gasto' in str(row.get('TIPO','Gasto')) else pago_mensual,
+                    'CATEGORIA': str(row['DESCRIPCION']).split()[0], # Simple categorización
+                    'TIPO_FLUJO': 'Diferido' if plazo > 1 else 'Contado'
+                })
+        except: continue
+
+    return pd.DataFrame(pagos_proyectados)
 
 @st.cache_data(ttl=5)
 def cargar_datos_master():
@@ -212,7 +261,12 @@ def procesar_telegram(sh):
 
 # ================= INTERFAZ PRINCIPAL =================
 df_movs, df_deudas, df_inv, calendario, alertas, sh_obj = cargar_datos_master()
-
+# --- 🚀 AQUÍ LA MAGIA: Generamos el Flujo Real ---
+if not df_movs.empty:
+    df_flujo_real = generar_flujo_real(df_movs)
+else:
+    df_flujo_real = pd.DataFrame()
+# --------------------------------------------------
 # --- SIDEBAR: CENTRO DE MANDO ---
 with st.sidebar:
     st.title("🎛️ Centro de Mando")
@@ -280,38 +334,49 @@ tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard Visual", "📅 Calendario", "�
 
 # TAB 1: DASHBOARD VISUAL (Estilo V3)
 with tab1:
+    # Usamos df_movs para SALDO TOTAL (porque el dinero ya salió del banco)
     saldo = df_movs['IMPORTE_REAL'].sum() if not df_movs.empty else 0
-    inv = 0
-    if not df_inv.empty:
-        # Calculo simple de valor actual inv
-        inv = df_inv['MONTO_INICIAL'].sum() # Simplificado para velocidad
     
+    # ... (código de inversiones igual) ...
+    inv = df_inv['MONTO_INICIAL'].sum() if not df_inv.empty else 0
+   
     col1, col2, col3 = st.columns(3)
     col1.metric("💰 Liquidez Total", f"${saldo:,.2f}")
     col2.metric("📈 En Inversiones", f"${inv:,.2f}")
-    
-    # GASTOS DEL MES
+   
+    # --- CAMBIO: USAMOS df_flujo_real PARA GASTOS DEL MES ---
     hoy = datetime.now()
-    if not df_movs.empty:
-        mask_mes = (df_movs['FECHA'].dt.month == hoy.month) & (df_movs['FECHA'].dt.year == hoy.year)
-        gastos_mes = abs(df_movs[mask_mes & (df_movs['IMPORTE_REAL'] < 0)]['IMPORTE_REAL'].sum())
-        col3.metric("💸 Gastos Este Mes", f"${gastos_mes:,.2f}")
+    gastos_mes = 0
+    if not df_flujo_real.empty:
+        # Filtramos por el mes de pago REAL, no la fecha de compra
+        mask_mes = (df_flujo_real['FECHA'].dt.month == hoy.month) & (df_flujo_real['FECHA'].dt.year == hoy.year)
+        # Sumamos solo lo negativo (gastos)
+        gastos_mes = abs(df_flujo_real[mask_mes & (df_flujo_real['IMPORTE_REAL'] < 0)]['IMPORTE_REAL'].sum())
     
+    col3.metric("💸 Gastos Reales (MSI)", f"${gastos_mes:,.2f}")
+   
     # GRÁFICOS
-    if not df_movs.empty:
+    if not df_flujo_real.empty:
         c_g1, c_g2 = st.columns(2)
         with c_g1:
-            gastos = df_movs[df_movs['IMPORTE_REAL'] < 0].copy()
-            gastos['Cat'] = gastos['DESCRIPCION'].str.split().str[0]
-            fig = px.pie(gastos, values='IMPORTE', names='Cat', title="Gastos por Concepto")
-            st.plotly_chart(fig, use_container_width=True)
+            # --- CAMBIO: Gráfico basado en flujo real ---
+            gastos_plot = df_flujo_real[df_flujo_real['IMPORTE_REAL'] < 0].copy()
+            # Filtramos solo lo de ESTE mes para el gráfico de pastel
+            gastos_plot_mes = gastos_plot[(gastos_plot['FECHA'].dt.month == hoy.month) & (gastos_plot['FECHA'].dt.year == hoy.year)]
+            
+            if not gastos_plot_mes.empty:
+                fig = px.pie(gastos_plot_mes, values='IMPORTE', names='CATEGORIA', title="Gastos Reales de Este Mes")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Sin gastos registrados este mes.")
+                
         with c_g2:
-            # Evolución saldo
+            # Evolución saldo (Mantenemos df_movs original para ver historia real bancaria)
             df_evo = df_movs.sort_values('FECHA').copy()
             df_evo['Saldo Acum'] = df_evo['IMPORTE_REAL'].cumsum()
-            fig2 = px.line(df_evo, x='FECHA', y='Saldo Acum', title="Evolución de tu Dinero")
+            fig2 = px.line(df_evo, x='FECHA', y='Saldo Acum', title="Evolución Histórica")
             st.plotly_chart(fig2, use_container_width=True)
-
+            
 # TAB 2: CALENDARIO (Estilo V5)
 with tab2:
     if calendario:
@@ -408,4 +473,3 @@ with tab4:
                         st.divider()
     else:
         st.info("Configura tus cuentas en el menú lateral.")
-
